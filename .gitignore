@@ -1,0 +1,42 @@
+# Model weights
+*.pt
+*.pth
+*.onnx
+*.bin
+*.safetensors
+
+# Databases
+*.db
+*.sqlite
+*.sqlite3
+*.sqlite-*
+*.db-wal
+*.db-shm
+
+# Evidence and generated media
+backend/storage/uploads/*
+backend/storage/artifacts/*
+!backend/storage/uploads/.gitkeep
+!backend/storage/artifacts/.gitkeep
+backend/demo_clips/
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+
+# Node
+node_modules/
+frontend/dist/
+*.tsbuildinfo
+
+# Environment and OS
+.env
+.env.*
+!.env.example
+.DS_Store
