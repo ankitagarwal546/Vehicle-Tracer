@@ -46,6 +46,9 @@ CONFUSABLE_CLUSTERS = [
     ("22BH6517AA", "Kia", "Seltos", "suv", "white", "ACTIVE"),
     ("22BH6S17AB", "Kia", "Sonet", "suv", "white", "ACTIVE"),
     ("23BH6517AA", "Mahindra", "XUV700", "suv", "black", "ACTIVE"),
+    ("MH14GT7319", "Ashok Leyland", "Viking Bus", "bus", "blue", "STOLEN_ALERT"),
+    ("MH14GT7819", "Ashok Leyland", "Viking Bus", "bus", "white", "ACTIVE"),
+    ("MH14CT7319", "Tata", "Starbus", "bus", "blue", "ACTIVE"),
 ]
 
 

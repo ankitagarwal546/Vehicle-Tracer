@@ -100,11 +100,33 @@ def _offsets(plate: PlateEvidence, registry_len: int) -> list[int]:
     return list(range(min(0, registry_len - query_len), max(0, registry_len - query_len) + 1))
 
 
+def _align_plate(plate: PlateEvidence, registry_plate: str) -> tuple[float, float, int]:
+    """Return ``(quality, gamma, offset)`` for the best slot alignment."""
+    known_slots = [(index, slot) for index, slot in enumerate(plate.slots) if slot.char != "?"]
+    if not known_slots:
+        return 0.0, 0.0, 0
+    length = len(registry_plate)
+    classes = expected_char_classes(registry_plate)
+    total_conf = sum(slot.confidence for _, slot in known_slots) or 1.0
+    gamma = min(len(known_slots) / max(length, 1), 1.0)
+    best_quality, best_offset = float("-inf"), 0
+    for offset in _offsets(plate, length):
+        total = 0.0
+        for index, slot in known_slots:
+            position = index + offset
+            if 0 <= position < length:
+                total += _score_slot(slot, registry_plate[position], classes[position])[1]
+            else:
+                total += SOFT_MISMATCH_PENALTY * slot.confidence
+        quality = total / total_conf - (SHIFT_PENALTY if offset and plate.anchor == "full" else 0.0)
+        if quality > best_quality:
+            best_quality, best_offset = quality, offset
+    return max(0.0, min(1.0, best_quality)), gamma, best_offset
+
+
 def score_plate(plate: PlateEvidence, registry_plate: str) -> tuple[float, float, float, int, int, list[SlotDiff]]:
     """Return ``(S_plate, quality, gamma, offset, hard_mismatches, slot_diff)``."""
-    known = plate.known_count
-    expected = max(len(registry_plate), 1)
-    if known == 0:
+    if plate.known_count == 0:
         diff = [
             SlotDiff(position=i, query="?", registry=ch, kind="unobserved", confidence=0.0, contribution=0.0)
             for i, ch in enumerate(registry_plate)
@@ -113,27 +135,7 @@ def score_plate(plate: PlateEvidence, registry_plate: str) -> tuple[float, float
 
     classes = expected_char_classes(registry_plate)
     slots = plate.slots
-    total_conf = sum(slot.confidence for slot in slots if slot.known) or 1.0
-    gamma = min(known / expected, 1.0)
-    best: tuple[float, int] | None = None
-
-    for offset in _offsets(plate, len(registry_plate)):
-        total = 0.0
-        for index, slot in enumerate(slots):
-            position = index + offset
-            if not slot.known:
-                continue
-            if 0 <= position < len(registry_plate):
-                total += _score_slot(slot, registry_plate[position], classes[position])[1]
-            else:
-                total += SOFT_MISMATCH_PENALTY * slot.confidence
-        quality = total / total_conf - (SHIFT_PENALTY if offset and plate.anchor == "full" else 0.0)
-        if best is None or quality > best[0]:
-            best = (quality, offset)
-
-    assert best is not None
-    quality, offset = best
-    quality = max(0.0, min(1.0, quality))
+    quality, gamma, offset = _align_plate(plate, registry_plate)
     by_position = {index + offset: slot for index, slot in enumerate(slots)}
     diff: list[SlotDiff] = []
     hard = 0
@@ -217,20 +219,43 @@ def _reasons(candidate: Candidate, query: QueryEvidence) -> list[str]:
     return reasons
 
 
-def _score_record(query: QueryEvidence, record: RegistryRecord, regime: str) -> Candidate:
-    plate_score, quality, gamma, offset, hard, diff = score_plate(query.plate, record.plate)
-    colour = score_colour(query, record)
-    body = score_body(query, record)
-    make_model = score_make_model(query, record)
-    signals = {"plate": plate_score, "colour": colour, "body_type": body, "make_model": make_model}
+class _AttributeCache:
+    """Attribute scores depend only on a few registry values, so compute each combination once."""
+
+    def __init__(self, query: QueryEvidence) -> None:
+        self.query = query
+        self.colour: dict[str, float | None] = {}
+        self.body: dict[str, float | None] = {}
+        self.make_model: dict[tuple[str, str], float | None] = {}
+
+    def scores(self, record: RegistryRecord) -> tuple[float | None, float | None, float | None]:
+        if record.colour not in self.colour:
+            self.colour[record.colour] = score_colour(self.query, record)
+        if record.body_type not in self.body:
+            self.body[record.body_type] = score_body(self.query, record)
+        key = (record.make, record.model)
+        if key not in self.make_model:
+            self.make_model[key] = score_make_model(self.query, record)
+        return self.colour[record.colour], self.body[record.body_type], self.make_model[key]
+
+
+def _combine(
+    query: QueryEvidence, regime: str, plate: float, colour: float | None, body: float | None, make_model: float | None
+) -> tuple[float, dict[str, float], bool]:
+    signals = {"plate": plate, "colour": colour, "body_type": body, "make_model": make_model}
     weights = _resolved_weights(regime, signals)
     raw = sum(weights[key] * (value or 0.0) for key, value in signals.items())
+    vetoed = body is not None and query.body_confidence > VETO_BODY_CONFIDENCE and body <= VETO_BODY_SIMILARITY
+    return raw * VETO_MULTIPLIER if vetoed else raw, weights, vetoed
+
+
+def _score_record(query: QueryEvidence, record: RegistryRecord, regime: str, cache: _AttributeCache) -> Candidate:
+    plate_score, quality, gamma, offset, hard, diff = score_plate(query.plate, record.plate)
+    colour, body, make_model = cache.scores(record)
+    raw, weights, vetoed = _combine(query, regime, plate_score, colour, body, make_model)
 
     contradictions: list[str] = []
-    vetoed = False
-    if body is not None and query.body_confidence > VETO_BODY_CONFIDENCE and body <= VETO_BODY_SIMILARITY:
-        vetoed = True
-        raw *= VETO_MULTIPLIER
+    if vetoed:
         contradictions.append(
             f"Hard veto: {query.body_type} observed at {query.body_confidence:.0%} conflicts with "
             f"registry {record.body_type}; score multiplied by {VETO_MULTIPLIER}."
@@ -264,13 +289,19 @@ def match(query: QueryEvidence, registry: Iterable[RegistryRecord], top_k: int =
     known = query.plate.known_count
     regime = regime_for(known)
     query = query.model_copy(update={"body_type": normalise_body(query.body_type) if query.body_type else None})
-    scored = sorted(
-        (_score_record(query, record, regime) for record in records),
-        key=lambda c: (-c.score, -c.sub_scores.plate, c.vehicle.plate),
-    )
+    # Fast numeric pass over the registry. Full explanations are built only for the head.
+    cache = _AttributeCache(query)
+    fast: list[tuple[float, float, str, int, float | None]] = []
+    for index, record in enumerate(records):
+        quality, gamma, _ = _align_plate(query.plate, record.plate)
+        plate_score = quality * gamma
+        colour, body, make_model = cache.scores(record)
+        raw = _combine(query, regime, plate_score, colour, body, make_model)[0]
+        fast.append((-round(raw * 100, 2), -round(plate_score, 4), record.plate, index, body))
+    fast.sort(key=lambda row: row[:3])
 
     cap = SEVERE_CONFIDENCE_CAP if regime == "severe_occlusion" else 100.0
-    head = scored[: top_k + 1]
+    head = [_score_record(query, records[row[3]], regime, cache) for row in fast[: top_k + 1]]
     for index, candidate in enumerate(head):
         best_other = head[1].score if index == 0 and len(head) > 1 else head[0].score
         margin = max(candidate.score - best_other, 0.0)
@@ -294,11 +325,11 @@ def match(query: QueryEvidence, registry: Iterable[RegistryRecord], top_k: int =
                 f"{top.hard_mismatches} non-confusable contradictions."
             )
         if query.body_type and query.body_confidence > 0 and all(
-            (c.sub_scores.body_type or 0.0) < MIN_BODY_COMPATIBILITY for c in scored
+            (row[4] or 0.0) < MIN_BODY_COMPATIBILITY for row in fast
         ):
             diagnostics.append(f"No registry vehicle is body-compatible with {query.body_type}.")
         if regime == "severe_occlusion":
-            tied = sum(top.score - c.score <= AMBIGUITY_BAND for c in scored)
+            tied = sum(top.score + row[0] <= AMBIGUITY_BAND for row in fast)
             if tied >= AMBIGUITY_COUNT:
                 diagnostics.append(
                     f"Only {known} plate character(s) readable and {tied} vehicles score within "

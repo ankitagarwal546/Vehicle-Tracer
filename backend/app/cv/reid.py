@@ -8,13 +8,14 @@ import cv2
 import numpy as np
 
 from app.config import settings
-from app.cv.plate_fusion import UNKNOWN, align
+from app.cv.plate_fusion import UNKNOWN
 from app.engine.confusion_matrices import body_similarity, colour_similarity, is_confusable
 
 WEIGHT_VISUAL = 0.45
 WEIGHT_PLATE = 0.30
 WEIGHT_ATTRIBUTES = 0.25
 MIN_PLATE_OVERLAP = 3
+FULL_PLATE_LENGTH = 9
 PLATE_CONFLICT = 0.35
 OVERLAP_TEMPORAL_FACTOR = 0.55
 LONG_GAP_HOURS = 24.0
@@ -76,13 +77,22 @@ def plate_compatibility(a: str, b: str) -> float | None:
     """Return slot agreement over aligned known characters, or None without enough overlap."""
     if sum(c != UNKNOWN for c in a) < 2 or sum(c != UNKNOWN for c in b) < 2:
         return None
-    score, count = 0.0, 0
-    for i, j in align(a, b):
-        if a[i] == UNKNOWN or b[j] == UNKNOWN:
-            continue
-        count += 1
-        score += 1.0 if a[i] == b[j] else 0.65 if is_confusable(a[i], b[j]) else 0.0
-    return score / count if count >= MIN_PLATE_OVERLAP else None
+    # Two full-length reads share a coordinate frame. Partial reads may slide, and the
+    # shift with the most matched evidence wins so a tiny accidental overlap cannot.
+    full_frame = len(a) == len(b) and len(a) >= FULL_PLATE_LENGTH
+    shifts = [0] if full_frame else range(-(len(b) - 1), len(a))
+    best: tuple[float, float] | None = None
+    for shift in shifts:
+        score, count = 0.0, 0
+        for j, right in enumerate(b):
+            i = j + shift
+            if not 0 <= i < len(a) or a[i] == UNKNOWN or right == UNKNOWN:
+                continue
+            count += 1
+            score += 1.0 if a[i] == right else 0.65 if is_confusable(a[i], right) else 0.0
+        if count >= MIN_PLATE_OVERLAP and (best is None or (score, score / count) > best):
+            best = (score, score / count)
+    return best[1] if best else None
 
 
 def attribute_compatibility(a: TrackProfile, b: TrackProfile) -> float | None:

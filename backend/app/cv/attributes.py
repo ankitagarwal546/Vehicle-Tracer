@@ -15,7 +15,11 @@ COLOUR_REFERENCES: dict[str, tuple[int, int, int]] = {
 _NAMES = list(COLOUR_REFERENCES)
 _REFERENCE_LAB = np.array([COLOUR_REFERENCES[name] for name in _NAMES], dtype=np.float32)
 KMEANS_CLUSTERS = 4
-COLOUR_TEMPERATURE = 18.0
+COLOUR_TEMPERATURE = 9.0
+SHADOW_MAX_L = 75
+SHADOW_MAX_CHROMA = 16
+SHADOW_DISCOUNT = 0.25
+MIN_PAINT_SHARE = 0.2
 MAX_PIXELS = 4000
 
 BODY_PROMPTS: dict[str, list[str]] = {
@@ -38,9 +42,14 @@ YOLO_PRIORS: dict[str, dict[str, float]] = {
 YOLO_ONLY_BODY = {"car": "car", "two-wheeler": "two-wheeler", "bus": "bus", "truck": "heavy_truck"}
 
 
-def gray_world(image: np.ndarray) -> np.ndarray:
-    """Remove a global illuminant cast, such as sodium street lighting."""
-    pixels = image.reshape(-1, 3).astype(np.float32)
+def gray_world(image: np.ndarray, reference: np.ndarray | None = None) -> np.ndarray:
+    """Remove a global illuminant cast, such as sodium street lighting.
+
+    The illuminant is estimated from ``reference``, normally the full scene. Estimating it
+    from a crop filled by one vehicle would wrongly neutralise that vehicle's paint.
+    """
+    source = image if reference is None else reference
+    pixels = source.reshape(-1, 3).astype(np.float32)
     means = pixels.mean(axis=0)
     gains = means.mean() / np.maximum(means, 1.0)
     gains = np.clip(gains, 0.6, 1.6)
@@ -61,14 +70,16 @@ def body_panel_mask(shape: tuple[int, int], plate_bbox: tuple[int, int, int, int
 def estimate_colour(
     crops: list[np.ndarray],
     plate_boxes: list[tuple[int, int, int, int] | None] | None = None,
+    scenes: list[np.ndarray | None] | None = None,
 ) -> list[dict]:
-    """Return the top-2 canonical colours with probabilities."""
+    """Return the top-2 canonical colours. White balance is applied only with scene context."""
     boxes = plate_boxes or [None] * len(crops)
+    references = scenes or [None] * len(crops)
     samples: list[np.ndarray] = []
-    for crop, box in zip(crops[:5], boxes[:5]):
+    for crop, box, scene in zip(crops[:5], boxes[:5], references[:5]):
         if crop.shape[0] < 8 or crop.shape[1] < 8:
             continue
-        balanced = gray_world(crop)
+        balanced = gray_world(crop, scene) if scene is not None else crop
         lab = cv2.cvtColor(balanced, cv2.COLOR_BGR2LAB)
         selected = lab[body_panel_mask(crop.shape[:2], box) > 0]
         if selected.size:
@@ -84,6 +95,14 @@ def estimate_colour(
     cv2.setRNGSeed(0)
     _, labels, centers = cv2.kmeans(pixels, clusters, None, criteria, 3, cv2.KMEANS_PP_CENTERS)
     shares = np.bincount(labels.ravel(), minlength=clusters) / len(labels)
+    # Dark neutral clusters are usually glass or shadow. Discount them only when a painted
+    # cluster exists, so a genuinely black vehicle still resolves to black.
+    chroma = np.hypot(centers[:, 1] - 128, centers[:, 2] - 128)
+    is_shadow = (centers[:, 0] < SHADOW_MAX_L) & (chroma < SHADOW_MAX_CHROMA)
+    painted_share = float(shares[~is_shadow].sum())
+    if painted_share >= MIN_PAINT_SHARE:
+        shares = np.where(is_shadow, shares * SHADOW_DISCOUNT, shares)
+        shares = shares / shares.sum()
     votes = np.zeros(len(_NAMES), dtype=np.float64)
     for center, share in zip(centers, shares):
         distances = np.linalg.norm((_REFERENCE_LAB - center) * np.array([0.6, 1.0, 1.0]), axis=1)
