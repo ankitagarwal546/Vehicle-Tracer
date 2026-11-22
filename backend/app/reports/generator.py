@@ -65,6 +65,7 @@ def build_context(case: Case) -> dict:
             "first_seen_sec": vehicle.first_seen_sec, "last_seen_sec": vehicle.last_seen_sec,
             "frames_tracked": vehicle.frames_tracked, "attributes": vehicle.attributes,
             "fused_plate": vehicle.fused_plate, "keyframes": keyframes, "match": vehicle.match_result,
+            "overrides": vehicle.overrides,
         })
     entities = [{"id": e.id, "fused_plate": e.fused_plate, "timeline": e.timeline, "links": e.links,
                  "match_result": e.match_result} for e in case.entities]
@@ -149,6 +150,8 @@ def _reportlab_pdf(context: dict) -> bytes:
         match = vehicle["match"]
         story += [PageBreak(), Paragraph(f"Vehicle {escape(vehicle['id'])} - {escape(vehicle['camera_label'])}", heading),
                   p(f"{match['status']} - plate evidence {match['query_plate'] or 'unread'}", mono)]
+        if vehicle["overrides"]:
+            story.append(p(f"Includes investigator-verified values. AI read: {vehicle['fused_plate'].get('text') or 'unread'}"))
         pictures = [image(k.get("frame_uri"), 58 * mm) for k in vehicle["keyframes"]]
         if pictures:
             story.append(Table([pictures]))

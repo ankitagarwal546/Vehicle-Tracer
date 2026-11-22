@@ -48,7 +48,7 @@
 
 {% for v in vehicles %}<section class="vehicle">
 <h2>Vehicle <span class="mono">{{ v.id }}</span> · {{ v.camera_label }} · track {{ v.track_id }}</h2>
-<div class="verdict {{ 'ok' if v.match.status == 'CONFIDENT_SHORTLIST' else 'no' }}">{{ "CONFIDENT SHORTLIST FOUND" if v.match.status == "CONFIDENT_SHORTLIST" else "NO CONFIDENT MATCH" }} · plate evidence <span class="mono">{{ v.match.query_plate or "unread" }}</span></div>
+<div class="verdict {{ 'ok' if v.match.status == 'CONFIDENT_SHORTLIST' else 'no' }}">{{ "CONFIDENT SHORTLIST FOUND" if v.match.status == "CONFIDENT_SHORTLIST" else "NO CONFIDENT MATCH" }} · plate evidence <span class="mono">{{ v.match.query_plate or "unread" }}</span>{% if v.overrides %} · includes investigator-verified values; AI read <span class="mono">{{ v.fused_plate.text or "unread" }}</span>{% endif %}</div>
 <table><tr><th>Seen</th><th>Colour</th><th>Body type</th><th>Make / model</th></tr><tr>
 <td class="mono">{{ v.first_seen_sec }}–{{ v.last_seen_sec }} s ({{ v.frames_tracked }} frames)</td>
 <td>{% for c in v.attributes.colours %}{{ c.label }} {{ "%.0f"|format(c.confidence*100) }}%{% if not loop.last %}, {% endif %}{% endfor %}</td>
