@@ -1,23 +1,23 @@
 {
-  "seed": 20261127,
+  "seed": 20261128,
   "data": "labelled synthetic video fixtures, not real CCTV",
   "single_sighting_cases": 66,
   "cross_camera_sightings": 20,
-  "top1_accuracy": 0.9348,
+  "top1_accuracy": 0.8043,
   "top5_recall": 0.9783,
-  "mrr": 0.9529,
+  "mrr": 0.8822,
   "rankable_cases": 46,
-  "no_match_precision": 0.8571,
+  "no_match_precision": 0.8824,
   "no_match_recall": 1.0,
-  "promoted": 31,
+  "promoted": 32,
   "wrong_promotions": [],
-  "emitted_characters": 642,
-  "wrong_emitted_characters": 6,
-  "character_precision": 0.9907,
+  "emitted_characters": 626,
+  "wrong_emitted_characters": 7,
+  "character_precision": 0.9888,
   "characters_emitted_on_hidden_slots": 2,
-  "link_precision": 0.8,
-  "link_recall": 0.8,
-  "links_proposed": 10,
+  "link_precision": 1.0,
+  "link_recall": 0.7,
+  "links_proposed": 7,
   "true_link_pairs": 10,
   "negative_link_pairs": 180,
   "by_category": {
@@ -42,9 +42,9 @@
     "true_moving_occlusion": {
       "cases": 6,
       "outcomes": {
-        "PLATE_CANDIDATE": 3,
-        "NO_REGISTRY_MATCH": 2,
-        "INSUFFICIENT_PLATE": 1
+        "INSUFFICIENT_PLATE": 1,
+        "PLATE_CANDIDATE": 4,
+        "NO_REGISTRY_MATCH": 1
       }
     },
     "true_partial": {
@@ -63,40 +63,33 @@
   },
   "failures": [
     {
-      "id": "partial1",
+      "id": "partial11",
       "category": "true_partial",
+      "truth": "KA51VD9537",
+      "read": "KA51?9553",
+      "outcome": "NO_REGISTRY_MATCH"
+    },
+    {
+      "id": "partial14",
+      "category": "true_partial",
+      "truth": "KA01ME2486",
+      "read": "KA?1E2448",
+      "outcome": "NO_REGISTRY_MATCH"
+    },
+    {
+      "id": "moving0",
+      "category": "true_moving_occlusion",
       "truth": "UP16RX4569",
-      "read": "UP16RX5699",
-      "outcome": "NO_REGISTRY_MATCH"
-    },
-    {
-      "id": "partial8",
-      "category": "true_partial",
-      "truth": "TN22TN9572",
-      "read": "TN22N95572",
-      "outcome": "NO_REGISTRY_MATCH"
-    },
-    {
-      "id": "moving2",
-      "category": "true_moving_occlusion",
-      "truth": "HR10TM6224",
-      "read": "HR10M62224",
-      "outcome": "NO_REGISTRY_MATCH"
-    },
-    {
-      "id": "moving4",
-      "category": "true_moving_occlusion",
-      "truth": "MH01EV4234",
-      "read": "??01V4?2??",
-      "outcome": "NO_REGISTRY_MATCH"
-    },
-    {
-      "id": "moving5",
-      "category": "true_moving_occlusion",
-      "truth": "TN09HE4146",
-      "read": "????E41?6",
+      "read": "????R?45??",
       "outcome": "INSUFFICIENT_PLATE"
+    },
+    {
+      "id": "moving3",
+      "category": "true_moving_occlusion",
+      "truth": "CG12NE1792",
+      "read": "12NE792",
+      "outcome": "NO_REGISTRY_MATCH"
     }
   ],
-  "elapsed_sec": 249.5
+  "elapsed_sec": 277.1
 }

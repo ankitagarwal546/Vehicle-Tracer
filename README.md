@@ -1,6 +1,8 @@
-# Vehicle-Tracer
+# VITRA
 
-Vehicle-Tracer turns CCTV clips into explainable vehicle evidence. It tracks vehicles, recovers plate characters across frames, compares readable plates with a registry, and proposes cross-camera links for an investigator to review.
+**Vehicle Identification & Trace Analytics**
+
+VITRA (repository: Vehicle-Tracer) turns CCTV clips into explainable vehicle evidence. It tracks vehicles, recovers plate characters across frames, compares readable plates with a registry, and proposes cross-camera links for an investigator to review.
 
 It never invents an unreadable plate character. When plate evidence is insufficient, it returns **No confident match** and explains why.
 
@@ -88,11 +90,24 @@ Each camera has an explicit plate format: **Latin A-Z/0-9**, **India RTO/BH**, *
 
 The OCR alphabet is `A-Z` and `0-9`. For Thai, Arabic or other non-Latin plates, choose **Non-Latin, digits only**. Letters stay unknown, and only the longest numeric block is used.
 
+### Registry coverage
+
+Before analysis, a preflight compares each camera's plate format with the formats in the active registry. If a camera has no compatible records, the workspace shows the format and record count, then offers three choices: upload a compatible registry, change the format, or run OCR only. The API requires `acknowledge_no_coverage: true` for the OCR-only path, and the choice is written to the audit log.
+
+| Outcome | Meaning |
+| --- | --- |
+| `NO_REGISTRY_MATCH` | A compatible registry was searched and no vehicle matched |
+| `NO_REGISTRY_COVERAGE` | The plate was read, but the registry has no records in this format, so no search was possible |
+
+Plates with no coverage stay as OCR evidence. After a compatible registry is uploaded, **Re-match** compares the stored evidence with it and leaves the OCR evidence unchanged. If a Latin-format camera mostly reads a plate family the registry lacks, the workspace and reports flag a possible format gap. The app never changes the format itself.
+
 ## Image evidence
 
-For each plate read, the pipeline keeps a lossless, read-only raw crop and creates labelled derivatives: perspective correction when four reliable corners exist, grayscale + CLAHE, denoised, restrained unsharp mask, and 2x and 4x interpolation.
+For each plate read, the pipeline keeps a lossless, read-only raw crop and creates labelled derivatives: perspective correction when four reliable corners exist, grayscale + CLAHE, denoised, restrained unsharp mask, gamma correction, and 2x and 4x interpolation.
 
-OCR runs on all views as a batch and keeps each slot's character probabilities. A character that appears only in processed views is marked as unsupported by source pixels and stays `?` unless another frame's raw crop supports it. Generative super-resolution is deliberately not used.
+Plates are detected on the vehicle's lower-body region at native resolution, and the raw crop keeps its source-frame coordinates, timestamp and hash. OCR always reads the raw, CLAHE and 2x views. The remaining views are read when those disagree or any character is below 0.9. Each track records the frames it inspected, near-duplicate frames it skipped, and why frames gave no plate.
+
+A processed view can lower a character's confidence but cannot raise it above the raw crop's value. A character that appears only in processed views is marked as unsupported by source pixels and stays `?` unless another frame's raw crop supports it. Generative super-resolution is deliberately not used, and enhancement cannot restore detail the camera did not capture.
 
 Uploaded evidence is hashed and made read-only, and its hash is verified again before every analysis. Each run writes to a new artifact folder.
 
@@ -107,12 +122,18 @@ $$\text{conf}_i = P_i(c) \times \Bigl(1 - \prod_{f \in \text{support}(c)} (1 - \
 A slot is emitted as `?`, with the reason stored, when any of these is true:
 
 - Fused confidence is below `0.55`, or a single frame supports it below `0.78`.
-- Repeated frames disagree on the character.
+- Repeated frames disagree on the character, or fewer than two-thirds of the frames that saw the position agree.
 - The character appears only after image processing.
 - Reads disagree about the plate's length, so its position is unreliable.
 - The position was seen in too few frames compared with its neighbours.
 
 A multi-frame stack is shown and voted on, but it never counts as an independent frame.
+
+## Analysis runs
+
+Each run has its own ID. Tracks appear in the workspace as they finish, while reports keep using the last completed run. If a run is cancelled, fails or is interrupted by a restart, its partial tracks and artifacts are removed, previous results stay in place, and the audit log records what happened. Original evidence is never modified.
+
+Track analysis uses a bounded worker pool (half the CPU cores, up to 4). Every track is kept and graded **reliable** or **review**, with reasons such as a short duration, heavy occlusion or a clipped view.
 
 ## Matching
 
@@ -152,29 +173,29 @@ cd backend
 .venv/bin/python scripts/evaluate_pipeline.py --output ../docs/synthetic_pipeline_evaluation.json
 ```
 
-`evaluate_pipeline.py` renders labelled synthetic videos and runs them through the real detector, tracker, OCR, fusion, matcher and link logic. The set has 66 single-sighting cases (clear, partial, moving occlusion, ambiguous, unreadable and out-of-registry) plus 20 cross-camera sightings. Decision thresholds were not changed for this evaluation. Earlier seeds were used to find bugs, and the table reports the final unseen seed, `20261127`.
+`evaluate_pipeline.py` renders labelled synthetic videos and runs them through the real detector, tracker, OCR, fusion, matcher and link logic. The set has 66 single-sighting cases (clear, partial, moving occlusion, ambiguous, unreadable and out-of-registry) plus 20 cross-camera sightings. Decision thresholds were not changed for this evaluation. The table compares the previous release and this release on the same new seed, `20261128`. This seed is harder than the earlier reported seed, so its figures should not be compared with older tables.
 
-| Metric | Result |
-| --- | ---: |
-| Top-1 accuracy (46 rankable cases) | 93.5% |
-| Top-5 recall | 97.8% |
-| MRR | 0.953 |
-| No-match precision | 85.7% |
-| No-match recall | 100% |
-| Promoted results | 31, with 0 wrong |
-| Emitted character precision | 99.1% (6 wrong of 642) |
-| Characters emitted on covered positions | 2 |
-| Cross-camera link precision | 80% (8 of 10 proposals) |
-| Cross-camera link recall | 80% (8 of 10 true pairs) |
+| Metric | Previous release | This release |
+| --- | ---: | ---: |
+| Top-1 accuracy (46 rankable cases) | 78.3% | 80.4% |
+| Top-5 recall | 91.3% | 97.8% |
+| MRR | 0.848 | 0.882 |
+| No-match precision | 85.7% | 88.2% |
+| No-match recall | 100% | 100% |
+| Promoted results | 31, with 0 wrong | 32, with 0 wrong |
+| Emitted character precision | 98.7% (8 wrong of 632) | 98.9% (7 wrong of 626) |
+| Characters emitted on covered positions | 2 | 2 |
+| Cross-camera link precision | 100% (7 of 7 proposals) | 100% (7 of 7 proposals) |
+| Cross-camera link recall | 70% (7 of 10 true pairs) | 70% (7 of 10 true pairs) |
 
 Full results are in [`docs/synthetic_pipeline_evaluation.json`](docs/synthetic_pipeline_evaluation.json).
 
-**These figures describe one synthetic fixture set, not real-world accuracy.** The fixtures reuse one recoloured vehicle photo, which makes visual re-identification unusually hard and plate rendering unusually clean. Recolourings that the stock detector does not see as a vehicle are excluded. The result still shows real failure modes: OCR occasionally emits a character on a covered position, and false link proposals occur, which is why every link requires investigator review.
+**These figures describe one synthetic fixture set, not real-world accuracy.** The fixtures reuse one recoloured vehicle photo, which makes visual re-identification unusually hard and plate rendering unusually clean. Recolourings that the stock detector does not see as a vehicle are excluded. The result still shows real failure modes: OCR occasionally emits a wrong character or a character on a covered position, and true links can be missed. False link proposals occurred on earlier seeds, which is why every link requires investigator review.
 
 ## Known limitations
 
 - Matching accuracy has not been validated against a labelled real-world dataset, and no model was retrained on project data.
-- The default registry is synthetic and contains only India RTO/BH-style plates. Real UK or Thai footage is expected to return no registry match until a matching registry is uploaded.
+- The default registry is synthetic and contains only India RTO/BH-style plates. UK footage returns `NO_REGISTRY_COVERAGE` until a compatible registry is uploaded.
 - Plate format must be set by the operator, because automatic Thai-script detection was not reliable in testing.
 - OCR can be confidently wrong on degraded or partly covered plates. Multi-frame checks reduce this but do not eliminate it.
 - YOLOv8 uses COCO classes, so auto-rickshaws depend on the OpenCLIP refinement.
@@ -197,12 +218,17 @@ Ultralytics YOLO is distributed under AGPL-3.0 unless you hold an Ultralytics En
 | GET | `/api/cases/{id}` | Case detail and outcome summary |
 | POST | `/api/cases/{id}/clips` | Upload clips |
 | PATCH | `/api/cases/{id}/clips/{clip_id}` | Update capture time, timezone, location or plate format |
-| POST | `/api/cases/{id}/analyze` | Start the pipeline |
+| GET | `/api/cases/{id}/preflight` | Registry coverage, capture-time and single-clip checks |
+| POST | `/api/cases/{id}/analyze` | Start the pipeline. Returns 409 for a coverage gap unless acknowledged |
+| POST | `/api/cases/{id}/cancel` | Cancel a running analysis |
+| POST | `/api/cases/{id}/rescore` | Re-match stored OCR evidence with the current registry |
 | GET | `/api/cases/{id}/progress` | Live SSE progress |
 | GET | `/api/cases/{id}/vehicles[/{vehicle_id}]` | Tracks and evidence |
 | POST | `/api/cases/{id}/vehicles/{vehicle_id}/override` | Investigator override and re-rank |
 | POST | `/api/cases/{id}/entities/{entity_id}/review` | Confirm, reject or reopen a possible link |
 | GET | `/api/cases/{id}/report/html`, `/report/pdf?appendix=true&clip_id=` | Case or per-clip forensic reports |
+| GET | `/api/cases/{id}/export.csv`, `/export.json` | Export track outcomes, coverage and evidence |
+| GET | `/api/registry/coverage` | Compatible record counts by plate format |
 | GET | `/api/registry` | Search the registry |
 | POST | `/api/registry/upload` | Import CSV or JSON |
 | POST | `/api/registry/match-test` | Matcher sandbox |
