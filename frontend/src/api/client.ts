@@ -2,6 +2,8 @@ import type {
   CaseDetail,
   CaseSummary,
   Clip,
+  Preflight,
+  RegistrySnapshot,
   Entity,
   Health,
   MatchResult,
@@ -75,7 +77,14 @@ export const api = {
     }),
   reviewLink: (id: string, entityId: string, decision: ReviewStatus, note?: string) =>
     request<Entity>(`/cases/${id}/entities/${entityId}/review`, json({ decision, note })),
-  analyze: (id: string) => request<{ status: string }>(`/cases/${id}/analyze`, { method: "POST" }),
+  analyze: (id: string, acknowledgeNoCoverage = false) =>
+    request<{ status: string }>(`/cases/${id}/analyze`, json({ acknowledge_no_coverage: acknowledgeNoCoverage })),
+  preflight: (id: string) => request<Preflight>(`/cases/${id}/preflight`),
+  cancel: (id: string) => request<{ status: string }>(`/cases/${id}/cancel`, { method: "POST" }),
+  rescore: (id: string) =>
+    request<{ before: Record<string, number>; after: Record<string, number>; tracks: number }>(`/cases/${id}/rescore`, { method: "POST" }),
+  registryCoverage: () =>
+    request<RegistrySnapshot & { formats: { plate_format: PlateFormat; label: string; compatible_records: number }[] }>("/registry/coverage"),
   vehicles: (id: string) => request<{ vehicles: VehicleSummary[]; entities: Entity[] }>(`/cases/${id}/vehicles`),
   vehicle: (id: string, vehicleId: string) => request<VehicleDetail>(`/cases/${id}/vehicles/${vehicleId}`),
   override: (id: string, vehicleId: string, body: OverridePayload) =>
@@ -109,4 +118,6 @@ export const reportPdfUrl = (id: string, appendix = false, clipId?: string) => {
   const suffix = query.toString();
   return `/api/cases/${id}/report/pdf${suffix ? `?${suffix}` : ""}`;
 };
+export const exportUrl = (id: string, format: "csv" | "json", clipId?: string) =>
+  `/api/cases/${id}/export.${format}${clipId ? `?clip_id=${clipId}` : ""}`;
 export const progressUrl = (id: string) => `/api/cases/${id}/progress`;

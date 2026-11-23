@@ -2,7 +2,7 @@ import { FlaskConical, RefreshCw, Search, Upload, X } from "lucide-react";
 import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 import { api } from "../api/client";
 import { Shortlist } from "../components/Shortlist";
-import { Badge, Empty, Pagination, RegistryStatus, pretty } from "../components/ui";
+import { Badge, Empty, PageHeader, Pagination, RegistryStatus, pretty } from "../components/ui";
 import { BODY_TYPES, COLOURS, PLATE_FORMATS, type MatchResult, type PlateFormat, type RegistryVehicle } from "../types";
 
 const PAGE_SIZE = 25;
@@ -39,8 +39,12 @@ export default function RegistryManager({ onError, onRegistryChanged }: { onErro
   const [testFormat, setTestFormat] = useState<PlateFormat>("latin_any");
   const [result, setResult] = useState<MatchResult | null>(null);
   const [running, setRunning] = useState(false);
+  const [coverage, setCoverage] = useState<Awaited<ReturnType<typeof api.registryCoverage>> | null>(null);
   const file = useRef<HTMLInputElement>(null);
   const request = useRef(0);
+
+  const fetchCoverage = useCallback(() => api.registryCoverage().then(setCoverage).catch(() => setCoverage(null)), []);
+  useEffect(() => { void fetchCoverage(); }, [fetchCoverage]);
 
   const fetchRows = useCallback(async () => {
     const id = ++request.current;
@@ -70,9 +74,9 @@ export default function RegistryManager({ onError, onRegistryChanged }: { onErro
     if (mode === "replace" && !window.confirm(`Replace the entire registry with ${selected.name}? Existing rows will be deleted.`)) return;
     try {
       const outcome = await api.uploadRegistry(selected, mode);
-      setNotice(`${selected.name}: ${outcome.inserted} added, ${outcome.updated} updated, ${outcome.rejected} rejected. Registry now holds ${outcome.total.toLocaleString()}.`);
+      setNotice(`${selected.name}: ${outcome.inserted} added, ${outcome.updated} updated, ${outcome.rejected} rejected. Registry now holds ${outcome.total.toLocaleString()}. Open a completed case and use Re-match to compare its stored OCR evidence.`);
       setPage(1);
-      await fetchRows();
+      await Promise.all([fetchRows(), fetchCoverage()]);
       onRegistryChanged();
     } catch (error) {
       onError((error as Error).message);
@@ -100,6 +104,8 @@ export default function RegistryManager({ onError, onRegistryChanged }: { onErro
   const allSynthetic = registryTotal > 0 && syntheticCount === registryTotal;
 
   return (
+    <>
+    <PageHeader eyebrow="Reference data" title="Vehicle registry" description="Records that readable plates are compared with, and how well they cover each camera plate format." />
     <div className="relative grid items-start gap-3 lg:grid-cols-[minmax(0,1fr)_auto]">
       <section className="panel min-w-0">
         <div className="panel-head flex-wrap">
@@ -117,6 +123,16 @@ export default function RegistryManager({ onError, onRegistryChanged }: { onErro
           <div className="border-b border-amber-200 bg-amber-50 px-3 py-1.5 text-xs text-amber-900">
             {allSynthetic ? "This registry is entirely synthetic test data." : `${syntheticCount.toLocaleString()} of ${registryTotal.toLocaleString()} vehicles are synthetic test data.`} People and plates are fictional. Upload a real registry to identify real vehicles.
           </div>
+        )}
+        {coverage && (
+          <dl className="grid grid-cols-2 gap-px border-b border-line bg-line xl:grid-cols-4" aria-label="Registry coverage by camera plate format">
+            {coverage.formats.map((item) => (
+              <div key={item.plate_format} className={`px-3 py-1.5 ${item.compatible_records ? "bg-surface" : "bg-amber-50"}`}>
+                <dt className="text-2xs text-muted">{item.label}</dt>
+                <dd className={`num text-sm font-semibold ${item.compatible_records ? "" : "text-amber-900"}`}>{item.compatible_records.toLocaleString()} <span className="text-2xs font-normal text-muted">compatible</span></dd>
+              </div>
+            ))}
+          </dl>
         )}
         {notice && <div className="border-b border-emerald-200 bg-emerald-50 px-3 py-1.5 text-xs text-emerald-900">{notice}</div>}
         <div className="grid gap-2 border-b border-line p-2 sm:grid-cols-2 lg:grid-cols-[minmax(0,2fr)_1fr_1fr_1fr_1fr]">
@@ -140,7 +156,7 @@ export default function RegistryManager({ onError, onRegistryChanged }: { onErro
               <thead><tr>{["Plate", "Make", "Model", "Body", "Colour", "Year", "Registered owner", "City", "Status", "Source"].map((h) => <th key={h} className="th">{h}</th>)}</tr></thead>
               <tbody>{rows.map((row) => (
                 <tr key={row.plate} className="hover:bg-canvas">
-                  <td className="td num font-semibold">{row.plate}</td><td className="td">{row.make}</td><td className="td">{row.model}</td><td className="td">{pretty(row.body_type)}</td><td className="td">{row.colour}</td><td className="td num">{row.year ?? ""}</td><td className="td">{row.owner_name ?? ""}</td><td className="td">{row.owner_city ?? ""}</td><td className="td"><RegistryStatus status={row.status} /></td><td className="td"><Badge tone={row.source === "synthetic" ? "amber" : "navy"}>{row.source}</Badge></td>
+                  <td className="td num font-semibold">{row.plate}</td><td className="td">{row.make}</td><td className="td">{row.model}</td><td className="td">{pretty(row.body_type)}</td><td className="td">{row.colour}</td><td className="td num">{row.year ?? ""}</td><td className="td">{row.owner_name ?? ""}</td><td className="td">{row.owner_city ?? ""}</td><td className="td"><RegistryStatus status={row.status} /></td><td className="td"><Badge tone={row.source === "synthetic" ? "amber" : "accent"}>{row.source}</Badge></td>
                 </tr>
               ))}</tbody>
             </table>
@@ -159,7 +175,7 @@ export default function RegistryManager({ onError, onRegistryChanged }: { onErro
           </div>
           <form className="space-y-2 border-b border-line p-3" onSubmit={submit}>
             <label className="block"><span className="label">Partial plate, use ? for unknown</span><input className="field font-mono uppercase" value={plate} maxLength={16} onChange={(e) => setPlate(e.target.value.toUpperCase())} /></label>
-            <label className="block"><span className="label">Character confidence <span className="num">{plateConf.toFixed(2)}</span></span><input type="range" min={0.3} max={1} step={0.01} value={plateConf} onChange={(e) => setPlateConf(Number(e.target.value))} className="w-full accent-[#1E3A5F]" /></label>
+            <label className="block"><span className="label">Character confidence <span className="num">{plateConf.toFixed(2)}</span></span><input type="range" min={0.3} max={1} step={0.01} value={plateConf} onChange={(e) => setPlateConf(Number(e.target.value))} className="w-full accent-accent" /></label>
             <div className="grid grid-cols-2 gap-2">
               <label><span className="label">Colour</span><select className="field" value={testColour} onChange={(e) => setTestColour(e.target.value)}><option value="">Unknown</option>{COLOURS.map((v) => <option key={v} value={v}>{v}</option>)}</select></label>
               <label><span className="label">Body type</span><select className="field" value={testBody} onChange={(e) => setTestBody(e.target.value)}><option value="">Unknown</option>{BODY_TYPES.map((v) => <option key={v} value={v}>{pretty(v)}</option>)}</select></label>
@@ -171,5 +187,6 @@ export default function RegistryManager({ onError, onRegistryChanged }: { onErro
         </aside>
       )}
     </div>
+    </>
   );
 }

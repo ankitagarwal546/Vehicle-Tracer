@@ -25,7 +25,7 @@ const banner = {
   emerald: "border-emerald-200 bg-emerald-50 text-emerald-900",
   amber: "border-amber-200 bg-amber-50 text-amber-900",
   crimson: "border-rose-200 bg-rose-50 text-rose-900",
-  navy: "border-navy/20 bg-navy-tint text-navy",
+  accent: "border-accent/20 bg-accent-tint text-accent-soft",
   slate: "border-line bg-canvas text-ink",
 };
 
@@ -60,6 +60,7 @@ function CandidateRow({ candidate, open, rejected }: { candidate: Candidate; ope
           <span className="mt-1 flex flex-wrap items-center gap-1.5 text-2xs text-muted">
             <span>{vehicle.colour} {vehicle.make} {vehicle.model} · {pretty(vehicle.body_type)}</span>
             {!rejected && <RegistryStatus status={vehicle.status} />}
+            {vehicle.source === "synthetic" && <Badge title="Fictional registry test data">Synthetic record</Badge>}
             {candidate.vetoed && <Badge tone="crimson">Body conflict</Badge>}
           </span>
         </span>
@@ -95,17 +96,20 @@ export function Shortlist({ result }: { result: MatchResult }) {
   const info = OUTCOMES[result.outcome];
   const suggestions = result.attribute_suggestions;
   const t = result.thresholds;
+  const coverage = result.registry_coverage;
+  const heading = result.outcome === "NO_REGISTRY_COVERAGE" ? "Registry not searched · No compatible records"
+    : result.status === "CONFIDENT_SHORTLIST" ? info.label : `No confident match · ${info.label}`;
   return (
     <div>
       <div className={`border-b px-3 py-2 ${banner[info.tone]}`}>
-        <div className="text-xs font-semibold">{result.status === "CONFIDENT_SHORTLIST" ? info.label : `No confident match · ${info.label}`}</div>
+        <div className="text-xs font-semibold">{heading}</div>
         <ul className="mt-0.5 space-y-0.5 text-2xs">
           {result.diagnostics.map((item) => <li key={item}>{item}</li>)}
         </ul>
       </div>
       <div className="flex flex-wrap justify-between gap-x-3 border-b border-line px-3 py-1 text-2xs text-muted">
         <span>{result.known_chars} readable plate character{result.known_chars === 1 ? "" : "s"}</span>
-        <span className="num">{result.registry_size.toLocaleString()} vehicles · {result.elapsed_ms.toFixed(1)} ms</span>
+        <span className="num">{coverage ? `${coverage.compatible_records.toLocaleString()} of ${coverage.total_records.toLocaleString()} compatible` : `${result.registry_size.toLocaleString()} vehicles`} · {result.elapsed_ms.toFixed(1)} ms</span>
       </div>
       {result.candidates.length > 0 && (
         <div className="border-b border-line bg-canvas px-3 py-1 text-2xs text-muted">Ordered by plate evidence. Scores are uncalibrated, not probabilities.</div>
@@ -132,7 +136,7 @@ export function Shortlist({ result }: { result: MatchResult }) {
               {suggestions.vehicles.map((vehicle) => (
                 <li key={vehicle.plate} className="flex flex-wrap justify-between gap-2 px-2 py-1">
                   <span className="num">{vehicle.plate}</span>
-                  <span>{vehicle.colour} {vehicle.make} {vehicle.model}</span>
+                  <span>{vehicle.colour} {vehicle.make} {vehicle.model}{vehicle.source === "synthetic" ? " · synthetic record" : ""}</span>
                 </li>
               ))}
             </ul>

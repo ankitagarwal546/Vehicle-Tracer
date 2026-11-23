@@ -1,5 +1,5 @@
 export type MatchStatus = "CONFIDENT_SHORTLIST" | "NO_CONFIDENT_MATCH";
-export type Outcome = "PLATE_CANDIDATE" | "AMBIGUOUS" | "NO_REGISTRY_MATCH" | "INSUFFICIENT_PLATE" | "UNREADABLE_PLATE";
+export type Outcome = "PLATE_CANDIDATE" | "AMBIGUOUS" | "NO_REGISTRY_MATCH" | "NO_REGISTRY_COVERAGE" | "INSUFFICIENT_PLATE" | "UNREADABLE_PLATE";
 export type ReviewStatus = "proposed" | "confirmed" | "rejected";
 export type PlateScript = "latin" | "non_latin";
 export type PlateFormat = "latin_any" | "india_rto" | "uk" | "non_latin_digits";
@@ -29,6 +29,62 @@ export interface Clip {
   processing: Record<string, number>;
 }
 
+export interface RegistryCoverage {
+  plate_format: string;
+  compatible_records: number;
+  total_records: number;
+  searched: boolean;
+}
+
+export interface CoverageRow {
+  clip_id: string;
+  camera_label: string;
+  plate_format: PlateFormat;
+  format_label: string;
+  compatible_records: number;
+  total_records: number;
+  status: "covered" | "no_coverage";
+}
+
+export interface RegistrySnapshot {
+  total: number;
+  synthetic: number;
+  note: string;
+  fingerprint: string;
+  by_family: { family: string; label: string; records: number }[];
+}
+
+export interface Preflight {
+  coverage: CoverageRow[];
+  registry: RegistrySnapshot;
+  warnings: { code: string; severity: "high" | "medium" | "info"; clip_id: string | null; message: string }[];
+  next_steps: string[];
+  requires_acknowledgement: boolean;
+}
+
+export interface TrackQuality {
+  tier: "reliable" | "review";
+  reasons: string[];
+  duration_sec: number;
+  sampled_frames: number;
+  mean_detector_confidence: number;
+  mean_lower_occlusion: number;
+  truncated_share: number;
+  motion_ratio: number;
+  best_frame_sharpness: number;
+  median_box?: number[];
+  merged_fragments: number;
+  plate_inspection?: {
+    candidate_frames: number;
+    near_duplicates_skipped: number;
+    frames_inspected: number;
+    plates_read: number;
+    skipped_plate_already_stable: number;
+    skipped_no_plate_in_best_frames: number;
+    rejections: Record<string, number>;
+  };
+}
+
 export interface AuditEntry {
   id: number;
   vehicle_id: string | null;
@@ -54,6 +110,8 @@ export interface CaseSummary {
   vehicle_count: number;
   running: boolean;
   stale: boolean;
+  has_completed_run?: boolean;
+  showing_live_run?: boolean;
 }
 
 export interface CaseCounts {
@@ -61,18 +119,37 @@ export interface CaseCounts {
   plate_candidates: number;
   ambiguous: number;
   no_registry_match: number;
+  no_registry_coverage: number;
   insufficient_plate: number;
   unreadable_plate: number;
+  readable_plates: number;
+  partial_plates: number;
+  no_plate_chars: number;
+  tracks_reliable: number;
+  tracks_review: number;
   possible_links: number;
   confirmed_links: number;
   rejected_links: number;
   fragments_merged: number;
+  clip_count: number;
   clips_missing_time: number;
+  cross_camera_status: "not_tested_single_clip" | "evaluated";
+  cross_camera_note: string;
+  temporal_status: "available" | "partial" | "unavailable";
+  temporal_note: string;
+  coverage: CoverageRow[];
+  coverage_status: "covered" | "partial" | "none";
+  registry: RegistrySnapshot;
+  registry_changed: boolean;
+  format_changed: boolean;
+  format_hints: { clip_id: string; camera_label: string; family: string; family_label: string; reads: number; complete_reads: number; message: string }[];
+  score_note: string;
 }
 
 export interface CaseDetail extends CaseSummary {
   runtime: Record<string, unknown>;
   summary: CaseCounts;
+  preflight?: Preflight;
   clips: Clip[];
   entities: Entity[];
   audit: AuditEntry[];
@@ -136,6 +213,7 @@ export interface MatchResult {
   candidates: Candidate[];
   rejected_candidates: Candidate[];
   attribute_suggestions: { similar_count: number; vehicles: RegistryVehicle[]; basis: string[] };
+  registry_coverage?: RegistryCoverage | null;
   diagnostics: string[];
   thresholds: Record<string, number>;
   score_is_calibrated: boolean;
@@ -201,6 +279,7 @@ export interface VehicleAttributes {
   yolo_class?: string;
   partial_view?: boolean;
   merged_track_ids?: number[];
+  track_quality?: TrackQuality;
 }
 
 export interface VehicleSummary {
@@ -227,7 +306,9 @@ export interface VehicleSummary {
   link_status: ReviewStatus | null;
   plate_script: PlateScript;
   plate_format: PlateFormat;
-  readability: "none" | "partial" | "comparable";
+  readability: "none" | "partial" | "readable";
+  registry_coverage?: RegistryCoverage | null;
+  track_quality?: TrackQuality | null;
 }
 
 export interface Keyframe {
@@ -246,10 +327,12 @@ export interface Keyframe {
   low_sharpness?: boolean;
   plate_box_confidence?: number;
   plate_crop_size?: [number, number];
+  plate_box_source?: number[] | null;
+  image_warnings?: string[];
   crop_sha256?: string;
   ocr_engine?: string;
   rectification?: { status: string; reason: string };
-  variants?: { name: string; label: string; kind: string; image: string; text: string; mean_confidence: number }[];
+  variants?: { name: string; label: string; kind: string; image: string; width?: number; height?: number; ocr_read?: boolean; text: string; mean_confidence: number }[];
   ocr_source?: string;
 }
 
@@ -333,6 +416,15 @@ export interface ProgressEvent {
   percent: number;
   message: string;
   status: string;
+  stage_label?: string;
+  elapsed_sec?: number;
+  eta_sec?: number | null;
+  tracks_done?: number;
+  tracks_in_clip?: number;
+  frames_done?: number;
+  frames_total?: number;
+  clip_index?: number;
+  clip_count?: number;
 }
 
 export interface OverridePayload {
