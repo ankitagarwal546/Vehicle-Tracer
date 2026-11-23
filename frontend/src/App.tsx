@@ -1,7 +1,8 @@
 import { Download, FileText, Plus, X } from "lucide-react";
-import { useCallback, useEffect, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { api, reportHtmlUrl, reportPdfUrl } from "./api/client";
-import { Badge } from "./components/ui";
+import { ErrorBoundary } from "./components/ErrorBoundary";
+import { Badge, OUTCOME_ORDER } from "./components/ui";
 import CaseWorkspace from "./pages/CaseWorkspace";
 import RegistryManager from "./pages/RegistryManager";
 import Traceability from "./pages/Traceability";
@@ -19,14 +20,24 @@ const VIEWS: { id: View; label: string }[] = [
 const statusTone = (status?: string) =>
   status === "COMPLETED" ? "emerald" : status === "FAILED" ? "crimson" : status === "RUNNING" || status === "QUEUED" ? "amber" : "slate";
 
+function readHash(): { caseId: string | null; view: View; vehicleId: string | null } {
+  const [caseId, view, vehicleId] = window.location.hash.replace(/^#\/?/, "").split("/");
+  return {
+    caseId: caseId || null,
+    view: VIEWS.some((item) => item.id === view) ? (view as View) : "case",
+    vehicleId: vehicleId || null,
+  };
+}
+
 export default function App() {
-  const [view, setView] = useState<View>("case");
+  const initial = useRef(readHash());
+  const [view, setView] = useState<View>(initial.current.view);
   const [cases, setCases] = useState<CaseSummary[]>([]);
-  const [caseId, setCaseId] = useState<string | null>(null);
+  const [caseId, setCaseId] = useState<string | null>(initial.current.caseId);
   const [detail, setDetail] = useState<CaseDetail | null>(null);
   const [vehicles, setVehicles] = useState<VehicleSummary[]>([]);
   const [entities, setEntities] = useState<Entity[]>([]);
-  const [vehicleId, setVehicleId] = useState<string | null>(null);
+  const [vehicleId, setVehicleId] = useState<string | null>(initial.current.vehicleId);
   const [health, setHealth] = useState<Health | null>(null);
   const [error, setError] = useState("");
   const [creating, setCreating] = useState(false);
@@ -38,7 +49,7 @@ export default function App() {
     try {
       const list = await api.listCases();
       setCases(list);
-      const target = caseId ?? list[0]?.id ?? null;
+      const target = caseId && list.some((item) => item.id === caseId) ? caseId : list[0]?.id ?? null;
       if (target !== caseId) setCaseId(target);
       if (!target) return;
       const [nextDetail, nextVehicles] = await Promise.all([api.getCase(target), api.vehicles(target)]);
@@ -51,6 +62,11 @@ export default function App() {
   }, [caseId]);
 
   useEffect(() => { void refresh(); void refreshHealth(); }, [refresh, refreshHealth]);
+
+  useEffect(() => {
+    const next = caseId ? `#/${caseId}/${view}${view === "inspector" && vehicleId ? `/${vehicleId}` : ""}` : "";
+    if (window.location.hash !== next) window.history.replaceState(null, "", next || window.location.pathname);
+  }, [caseId, view, vehicleId]);
 
   const selectCase = (id: string) => {
     setCaseId(id);
@@ -76,46 +92,51 @@ export default function App() {
 
   const openVehicle = useCallback((id: string) => { setVehicleId(id); setView("inspector"); }, []);
   const hasResults = detail?.status === "COMPLETED";
+  const review = entities.filter((entity) => entity.review_status === "proposed").length;
+  const ordered = useMemo(() => [...vehicles].sort((a, b) =>
+    OUTCOME_ORDER.indexOf(a.outcome ?? "UNREADABLE_PLATE") - OUTCOME_ORDER.indexOf(b.outcome ?? "UNREADABLE_PLATE")
+    || (b.top_score ?? 0) - (a.top_score ?? 0) || b.known_chars - a.known_chars || b.frames_tracked - a.frames_tracked), [vehicles]);
 
   return (
     <div className="flex min-h-full flex-col">
       <header className="border-b border-line bg-white">
-        <div className="flex flex-wrap items-center gap-x-3 gap-y-2 px-4 py-2">
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-2 px-3 py-2 sm:px-4">
           <div className="text-sm font-semibold tracking-tight text-navy">Vehicle Tracer</div>
           <span className="hidden h-4 w-px bg-line sm:block" />
-          <select aria-label="Select case" className="field w-auto max-w-[220px]" value={caseId ?? ""} onChange={(e) => selectCase(e.target.value)}>
+          <select aria-label="Select case" className="field w-auto min-w-0 max-w-[200px]" value={caseId ?? ""} onChange={(e) => selectCase(e.target.value)}>
             {!cases.length && <option value="">No cases</option>}
             {cases.map((item) => <option key={item.id} value={item.id}>{item.title}</option>)}
           </select>
           {creating ? (
             <form className="flex items-center gap-1" onSubmit={createCase}>
-              <input autoFocus aria-label="Case title" className="field w-44" placeholder="Case title" value={title} onChange={(e) => setTitle(e.target.value)} />
+              <input autoFocus aria-label="Case title" className="field w-40" placeholder="Case title" value={title} onChange={(e) => setTitle(e.target.value)} />
               <button className="btn btn-primary">Create</button>
               <button type="button" className="btn" aria-label="Cancel" onClick={() => setCreating(false)}><X size={16} /></button>
             </form>
           ) : <button className="btn" onClick={() => setCreating(true)}><Plus size={16} /> New case</button>}
           {detail && <Badge tone={statusTone(detail.status)}>{detail.status.toLowerCase()}</Badge>}
-          <div className="ml-auto flex flex-wrap items-center gap-2">
-            {health && <span className="num hidden text-2xs text-muted xl:inline">{health.models.device} · registry {health.registry_count} · v{health.pipeline_version}</span>}
+          <div className="flex w-full flex-wrap items-center gap-1.5 md:ml-auto md:w-auto">
+            {health && <span className="num mr-1 hidden text-2xs text-muted 2xl:inline">{health.models.device} · registry {health.registry_count.toLocaleString()}{health.synthetic_count === health.registry_count ? " synthetic" : ""} · v{health.pipeline_version}</span>}
             {caseId && hasResults ? (
               <>
-                <a className="btn" href={reportHtmlUrl(caseId)} target="_blank" rel="noreferrer"><FileText size={16} /> Preview HTML report</a>
-                <a className="btn btn-primary" href={reportPdfUrl(caseId)}><Download size={16} /> Download PDF report</a>
+                <a className="btn" href={reportHtmlUrl(caseId)} target="_blank" rel="noreferrer"><FileText size={16} /> HTML report</a>
+                <a className="btn btn-primary" href={reportPdfUrl(caseId)}><Download size={16} /> PDF report</a>
+                <a className="btn" href={reportPdfUrl(caseId, true)}>PDF + appendix</a>
               </>
             ) : (
               <>
-                <button className="btn" disabled title="Available after analysis"><FileText size={16} /> Preview HTML report</button>
-                <button className="btn btn-primary" disabled title="Available after analysis"><Download size={16} /> Download PDF report</button>
+                <button className="btn" disabled title="Available after analysis"><FileText size={16} /> HTML report</button>
+                <button className="btn btn-primary" disabled title="Available after analysis"><Download size={16} /> PDF report</button>
               </>
             )}
           </div>
         </div>
-        <nav className="flex gap-1 overflow-x-auto px-3" aria-label="Workbench views">
+        <nav className="grid grid-cols-2 gap-x-1 px-2 sm:flex sm:px-3" aria-label="Workbench views">
           {VIEWS.map((item) => (
             <button key={item.id} onClick={() => setView(item.id)} aria-current={view === item.id ? "page" : undefined}
-              className={`whitespace-nowrap border-b-2 px-2.5 py-1.5 text-xs font-medium ${view === item.id ? "border-navy text-navy" : "border-transparent text-muted hover:text-ink"}`}>
+              className={`border-b-2 px-2.5 py-1.5 text-left text-xs font-medium sm:whitespace-nowrap ${view === item.id ? "border-navy text-navy" : "border-transparent text-muted hover:text-ink"}`}>
               {item.label}
-              {item.id === "trace" && entities.length > 0 && <span className="num ml-1 text-2xs">{entities.length}</span>}
+              {item.id === "trace" && review > 0 && <span className="num ml-1 text-2xs text-amber-800">{review}</span>}
             </button>
           ))}
         </nav>
@@ -127,13 +148,15 @@ export default function App() {
         </div>
       )}
 
-      <main className="flex-1 p-3 sm:p-4">
+      <main className="min-w-0 flex-1 p-2 sm:p-4">
+        <ErrorBoundary resetKey={`${caseId}-${view}-${vehicleId}`}>
         {view === "case" && <CaseWorkspace detail={detail} vehicles={vehicles} onRefresh={refresh} onOpenVehicle={openVehicle} onError={setError} />}
         {view === "inspector" && (caseId
-          ? <VehicleInspector caseId={caseId} vehicleId={vehicleId ?? vehicles[0]?.id ?? null} onBack={() => setView("case")} onChanged={refresh} onError={setError} />
+          ? <VehicleInspector caseId={caseId} vehicleId={vehicleId ?? ordered[0]?.id ?? null} vehicles={ordered} onOpenVehicle={openVehicle} onBack={() => setView("case")} onChanged={refresh} onError={setError} />
           : <div className="panel p-6 text-center text-xs text-muted">Create a case first.</div>)}
-        {view === "trace" && <Traceability entities={entities} clipCount={detail?.clips.length ?? 0} onOpenVehicle={openVehicle} />}
+        {view === "trace" && <Traceability caseId={caseId} entities={entities} clipCount={detail?.clips.length ?? 0} onOpenVehicle={openVehicle} onChanged={refresh} onError={setError} />}
         {view === "registry" && <RegistryManager onError={setError} onRegistryChanged={refreshHealth} />}
+        </ErrorBoundary>
       </main>
     </div>
   );

@@ -1,4 +1,7 @@
 export type MatchStatus = "CONFIDENT_SHORTLIST" | "NO_CONFIDENT_MATCH";
+export type Outcome = "PLATE_CANDIDATE" | "AMBIGUOUS" | "NO_REGISTRY_MATCH" | "INSUFFICIENT_PLATE" | "UNREADABLE_PLATE";
+export type ReviewStatus = "proposed" | "confirmed" | "rejected";
+export type PlateScript = "latin" | "non_latin";
 export type SlotKind = "exact" | "confusable" | "unknown" | "mismatch" | "hard_mismatch" | "unobserved";
 
 export interface Clip {
@@ -16,6 +19,7 @@ export interface Clip {
   duration_sec: number;
   frame_count: number;
   codec: string;
+  plate_script: PlateScript;
   processing: Record<string, number>;
 }
 
@@ -43,10 +47,26 @@ export interface CaseSummary {
   clip_count: number;
   vehicle_count: number;
   running: boolean;
+  stale: boolean;
+}
+
+export interface CaseCounts {
+  tracks: number;
+  plate_candidates: number;
+  ambiguous: number;
+  no_registry_match: number;
+  insufficient_plate: number;
+  unreadable_plate: number;
+  possible_links: number;
+  confirmed_links: number;
+  rejected_links: number;
+  fragments_merged: number;
+  clips_missing_time: number;
 }
 
 export interface CaseDetail extends CaseSummary {
   runtime: Record<string, unknown>;
+  summary: CaseCounts;
   clips: Clip[];
   entities: Entity[];
   audit: AuditEntry[];
@@ -63,6 +83,7 @@ export interface RegistryVehicle {
   owner_name: string | null;
   owner_city: string | null;
   status: string;
+  source: string;
 }
 
 export interface SlotDiff {
@@ -78,7 +99,6 @@ export interface Candidate {
   rank: number;
   vehicle: RegistryVehicle;
   score: number;
-  confidence: number;
   sub_scores: {
     plate: number;
     colour: number | null;
@@ -90,7 +110,11 @@ export interface Candidate {
   weights: Record<string, number>;
   slot_diff: SlotDiff[];
   alignment_offset: number;
+  exact_chars: number;
+  confusable_chars: number;
   hard_mismatches: number;
+  plate_supported: boolean;
+  blocking_reasons: string[];
   vetoed: boolean;
   contradictions: string[];
   reasons: string[];
@@ -98,12 +122,17 @@ export interface Candidate {
 
 export interface MatchResult {
   status: MatchStatus;
+  outcome: Outcome;
+  reason_codes: string[];
   regime: string;
   query_plate: string;
   known_chars: number;
   candidates: Candidate[];
   rejected_candidates: Candidate[];
+  attribute_suggestions: { similar_count: number; vehicles: RegistryVehicle[]; basis: string[] };
   diagnostics: string[];
+  thresholds: Record<string, number>;
+  score_is_calibrated: boolean;
   registry_size: number;
   elapsed_ms: number;
 }
@@ -115,6 +144,7 @@ export interface FusedSlot {
   candidates: { char: string; probability: number }[];
   support_frames: number;
   observed_frames: number;
+  evidence?: { frame_idx: number; timestamp_sec: number; char: string; confidence: number; source: string }[];
 }
 
 export interface MatrixRow {
@@ -122,6 +152,7 @@ export interface MatrixRow {
   timestamp_sec: number;
   raw_text: string;
   source: string;
+  derived?: boolean;
   sharpness: number;
   cells: { char: string; confidence: number }[];
 }
@@ -131,6 +162,8 @@ export interface FusedPlate {
   known_count: number;
   reads_used?: number;
   reads_rejected?: number;
+  rejected_reads?: { frame_idx: number; timestamp_sec: number; raw_text: string; reason: string }[];
+  stack_crop?: string | null;
   slots: FusedSlot[];
   matrix: MatrixRow[];
 }
@@ -144,6 +177,8 @@ export interface VehicleAttributes {
     below_threshold: { make: string; model: string; confidence: number }[];
   };
   yolo_class?: string;
+  partial_view?: boolean;
+  merged_track_ids?: number[];
 }
 
 export interface VehicleSummary {
@@ -160,9 +195,15 @@ export interface VehicleSummary {
   known_chars: number;
   attributes: VehicleAttributes;
   status: MatchStatus | null;
+  outcome: Outcome | null;
+  reason_codes: string[];
+  diagnostics: string[];
   top_plate: string | null;
-  top_confidence: number | null;
+  top_score: number | null;
+  closest_plate: string | null;
   overridden: boolean;
+  link_status: ReviewStatus | null;
+  plate_script: PlateScript;
 }
 
 export interface Keyframe {
@@ -174,7 +215,7 @@ export interface Keyframe {
   plate_raw?: string;
   plate_enhanced?: string;
   plate_text?: string;
-  plate_sharpness?: number;
+  plate_quality?: number;
   ocr_source?: string;
 }
 
@@ -200,9 +241,16 @@ export interface EntityLink {
   score: number;
   visual: number;
   plate: number | null;
+  plate_compared: number;
+  plate_exact: number;
+  plate_contradictions: number;
   attributes: number | null;
+  temporal_status: "plausible" | "weak" | "implausible" | "unavailable";
   temporal_factor: number;
   temporal_note: string;
+  location_context: string;
+  evidence_tier: string;
+  evidence_reason: string;
   weights: Record<string, number>;
 }
 
@@ -224,12 +272,18 @@ export interface Entity {
   timeline: TimelineEntry[];
   links: EntityLink[];
   match_result: MatchResult;
+  review_status: ReviewStatus;
+  evidence_tier: string;
+  reviewed_by: string | null;
+  reviewed_at: string | null;
+  review_note: string | null;
 }
 
 export interface Health {
   status: string;
   pipeline_version: string;
   registry_count: number;
+  synthetic_count: number;
   models: { device: string; plate_ocr: { engine: string | null }; clip: { loaded: boolean }; detector: { loaded: boolean } };
 }
 

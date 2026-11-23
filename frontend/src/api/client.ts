@@ -7,6 +7,8 @@ import type {
   MatchResult,
   MatchTestPayload,
   OverridePayload,
+  PlateScript,
+  ReviewStatus,
   AuditEntry,
   RegistryVehicle,
   VehicleDetail,
@@ -40,6 +42,7 @@ export interface ClipUpload {
   camera_label: string;
   location: string;
   recorded_at: string;
+  plate_script: PlateScript;
 }
 
 export const api = {
@@ -54,9 +57,18 @@ export const api = {
       form.append("camera_label", item.camera_label);
       form.append("location", item.location);
       form.append("recorded_at", item.recorded_at ? new Date(item.recorded_at).toISOString() : "");
+      form.append("plate_script", item.plate_script);
     }
     return request<{ clips: Clip[] }>(`/cases/${id}/clips`, { method: "POST", body: form });
   },
+  updateClip: (id: string, clipId: string, body: { recorded_at?: string | null; plate_script?: PlateScript }) =>
+    request<Clip>(`/cases/${id}/clips/${clipId}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  reviewLink: (id: string, entityId: string, decision: ReviewStatus, note?: string) =>
+    request<Entity>(`/cases/${id}/entities/${entityId}/review`, json({ decision, note })),
   analyze: (id: string) => request<{ status: string }>(`/cases/${id}/analyze`, { method: "POST" }),
   vehicles: (id: string) => request<{ vehicles: VehicleSummary[]; entities: Entity[] }>(`/cases/${id}/vehicles`),
   vehicle: (id: string, vehicleId: string) => request<VehicleDetail>(`/cases/${id}/vehicles/${vehicleId}`),
@@ -68,7 +80,7 @@ export const api = {
   registry: (params: Record<string, string | number>) => {
     const query = new URLSearchParams();
     Object.entries(params).forEach(([key, value]) => value !== "" && query.set(key, String(value)));
-    return request<{ items: RegistryVehicle[]; total: number; page: number; page_size: number }>(`/registry?${query}`);
+    return request<{ items: RegistryVehicle[]; total: number; page: number; page_size: number; registry_total: number; synthetic_count: number }>(`/registry?${query}`);
   },
   uploadRegistry: (file: File, mode: "merge" | "replace") => {
     const form = new FormData();
@@ -84,5 +96,5 @@ export const api = {
 
 export const artifactUrl = (path?: string | null) => (path ? `/artifacts/${path}` : undefined);
 export const reportHtmlUrl = (id: string) => `/api/cases/${id}/report/html`;
-export const reportPdfUrl = (id: string) => `/api/cases/${id}/report/pdf`;
+export const reportPdfUrl = (id: string, appendix = false) => `/api/cases/${id}/report/pdf${appendix ? "?appendix=true" : ""}`;
 export const progressUrl = (id: string) => `/api/cases/${id}/progress`;

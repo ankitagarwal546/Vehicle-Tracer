@@ -1,7 +1,7 @@
 import type { ReactNode } from "react";
-import type { MatchStatus } from "../types";
+import type { Outcome, ReviewStatus } from "../types";
 
-type Tone = "emerald" | "amber" | "crimson" | "slate" | "navy";
+export type Tone = "emerald" | "amber" | "crimson" | "slate" | "navy";
 
 const tones: Record<Tone, string> = {
   emerald: "border-emerald-300 bg-emerald-50 text-emerald-800",
@@ -11,18 +11,35 @@ const tones: Record<Tone, string> = {
   navy: "border-navy/30 bg-navy-tint text-navy",
 };
 
-export function Badge({ tone = "slate", children }: { tone?: Tone; children: ReactNode }) {
+export const OUTCOMES: Record<Outcome, { label: string; short: string; tone: Tone; help: string }> = {
+  PLATE_CANDIDATE: { label: "Plate-supported candidate", short: "Candidate", tone: "emerald", help: "Readable plate cleared every matching gate." },
+  AMBIGUOUS: { label: "Ambiguous candidates", short: "Ambiguous", tone: "amber", help: "Several registry plates fit the readable characters." },
+  NO_REGISTRY_MATCH: { label: "No registry match", short: "No match", tone: "crimson", help: "Plate is readable but no registry vehicle agrees with it." },
+  INSUFFICIENT_PLATE: { label: "Partial plate only", short: "Partial plate", tone: "navy", help: "Too few readable characters to shortlist a vehicle." },
+  UNREADABLE_PLATE: { label: "Plate unreadable", short: "Unreadable", tone: "slate", help: "No plate character could be read." },
+};
+
+export const OUTCOME_ORDER: Outcome[] = ["PLATE_CANDIDATE", "AMBIGUOUS", "NO_REGISTRY_MATCH", "INSUFFICIENT_PLATE", "UNREADABLE_PLATE"];
+
+export function Badge({ tone = "slate", children, title }: { tone?: Tone; children: ReactNode; title?: string }) {
   return (
-    <span className={`inline-flex items-center whitespace-nowrap border px-1.5 py-px text-2xs font-medium ${tones[tone]}`}>
+    <span title={title} className={`inline-flex items-center whitespace-nowrap border px-1.5 py-px text-2xs font-medium ${tones[tone]}`}>
       {children}
     </span>
   );
 }
 
-export function VerdictBadge({ status }: { status: MatchStatus | null }) {
-  if (status === "CONFIDENT_SHORTLIST") return <Badge tone="emerald">Shortlist</Badge>;
-  if (status === "NO_CONFIDENT_MATCH") return <Badge tone="crimson">No confident match</Badge>;
-  return <Badge>Pending</Badge>;
+export function OutcomeBadge({ outcome, long = false }: { outcome: Outcome | null; long?: boolean }) {
+  if (!outcome) return <Badge>Pending</Badge>;
+  const item = OUTCOMES[outcome];
+  return <Badge tone={item.tone} title={item.help}>{long ? item.label : item.short}</Badge>;
+}
+
+export function LinkBadge({ status }: { status: ReviewStatus | null }) {
+  if (status === "confirmed") return <Badge tone="emerald">Confirmed link</Badge>;
+  if (status === "proposed") return <Badge tone="amber">Possible link</Badge>;
+  if (status === "rejected") return <Badge>Link rejected</Badge>;
+  return null;
 }
 
 export function RegistryStatus({ status }: { status: string }) {
@@ -35,7 +52,7 @@ export function PlateText({ text, size = "md" }: { text: string; size?: "sm" | "
   const cell = { sm: "h-5 w-3.5 text-2xs", md: "h-6 w-[18px] text-xs", lg: "h-8 w-6 text-base" }[size];
   if (!text) return <span className="text-2xs text-muted">Plate not read</span>;
   return (
-    <span className="inline-flex font-mono font-semibold" aria-label={`Plate ${text.replaceAll("?", " unknown ")}`}>
+    <span className="inline-flex max-w-full flex-wrap font-mono font-semibold" aria-label={`Plate ${text.replaceAll("?", " unknown ")}`}>
       {[...text].map((char, index) => (
         <span
           key={index}
@@ -56,7 +73,7 @@ export function ScoreBar({ label, value, weight }: { label: string; value: numbe
         {value !== null && <span className="block h-full bg-navy" style={{ width: `${Math.max(0, Math.min(value, 1)) * 100}%` }} />}
       </span>
       <span className="num text-right">{value === null ? "n/a" : value.toFixed(2)}</span>
-      <span className="num text-right text-muted">{weight !== undefined ? `×${weight.toFixed(2)}` : ""}</span>
+      <span className="num text-right text-muted">{weight ? `×${weight.toFixed(2)}` : ""}</span>
     </div>
   );
 }
@@ -70,7 +87,30 @@ export function Empty({ title, children }: { title: string; children?: ReactNode
   );
 }
 
-export const percent = (value: number | null | undefined) => (value == null ? "n/a" : `${value.toFixed(1)}%`);
+export function Pagination({ page, pages, total, label, onChange }: {
+  page: number;
+  pages: number;
+  total: number;
+  label: string;
+  onChange: (page: number) => void;
+}) {
+  return (
+    <div className="flex flex-wrap items-center justify-between gap-2 px-3 py-2 text-xs">
+      <span className="num text-2xs text-muted">{total} {label} · page {page} of {pages}</span>
+      <span className="flex gap-1">
+        <button className="btn" disabled={page <= 1} onClick={() => onChange(page - 1)}>Previous</button>
+        <button className="btn" disabled={page >= pages} onClick={() => onChange(page + 1)}>Next</button>
+      </span>
+    </div>
+  );
+}
+
+export const score = (value: number | null | undefined) => (value == null ? "n/a" : value.toFixed(1));
 export const seconds = (value: number) => `${value.toFixed(2)}s`;
 export const shortHash = (hash: string) => `${hash.slice(0, 10)}…${hash.slice(-6)}`;
 export const pretty = (value: string) => value.replaceAll("_", " ");
+export const toLocalInput = (iso: string | null) => {
+  if (!iso) return "";
+  const date = new Date(iso);
+  return new Date(date.getTime() - date.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
+};
