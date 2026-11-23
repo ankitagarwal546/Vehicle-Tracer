@@ -14,7 +14,7 @@ flowchart LR
     B --> C[Full-clip adaptive sampling]
     C --> D[YOLOv8 + ByteTrack]
     D --> E[Track stitching and occlusion checks]
-    E --> F[Plate detection, enhancement, OCR]
+    E --> F[Plate detection, traceable variants, per-slot OCR]
     E --> G[Colour, body type, make/model estimates]
     F --> H[Position-aware multi-frame fusion]
     H --> I[Plate-first matcher]
@@ -46,7 +46,6 @@ cd backend
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 .venv/bin/python scripts/download_models.py
-.venv/bin/python scripts/generate_demo_clip.py
 .venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
 
@@ -58,21 +57,44 @@ npm ci
 npm run dev
 ```
 
-Open <http://127.0.0.1:5173>. The first model download needs internet access and is roughly 700 MB. Later runs work offline.
+Open <http://127.0.0.1:5173>.
 
-### Live demo
+`download_models.py` needs internet access once and fetches roughly 700 MB. The app never downloads weights at startup. If required weights are missing, analysis stops with the exact install command instead of producing substitute output. If only OpenCLIP is missing, the app runs and shows that make/model and fine body type are limited.
 
-1. Create a case and ingest `backend/demo_clips/camera_a_gate.mp4` and `camera_b_junction.mp4`. Give each a capture time.
-2. Select **Run analysis**.
-3. Camera A reads `MH14GT7`, which fits more than one registry plate, so it stays **Ambiguous**.
-4. Camera B reads `4GT7319`, which is a plausible partial-plate candidate.
-5. Open **Cross-camera trace**, compare the evidence, and confirm or reject the possible link.
-6. In **Registry and sandbox**, use the presets to see a full plate, an ambiguous plate, too few characters, attributes only, and a genuine no-match.
-7. Export the HTML or PDF report.
+Load the labelled synthetic demo in a third terminal while the API is running:
 
-### Non-Latin plates
+```bash
+cd backend
+.venv/bin/python scripts/generate_demo_clip.py
+.venv/bin/python scripts/create_demo_case.py
+```
 
-The OCR alphabet is `A-Z` and `0-9`. If a clip contains Thai, Arabic or other non-Latin plate letters, set its **Plate script** to **Non-Latin, digits only** and re-run analysis. Letters are withheld as unknown, and only the numeric block is used.
+### Synthetic demo walkthrough
+
+Every demo frame has a burned-in `SYNTHETIC TEST FIXTURE` banner, and each clip has ground truth in `demo_clips/synthetic_manifest.json`.
+
+| Camera | What it demonstrates | Expected outcome |
+| --- | --- | --- |
+| A Gate | Last three characters covered, and two registry plates still fit | Ambiguous |
+| B Junction | First three characters covered | Plate-supported partial shortlist |
+| C Depot | Ends covered in turn, and one middle character never visible | `?` preserved, plate-supported |
+| D Ring Road | No capture time | Link shows temporal validation unavailable |
+| E Toll | Clear plate that is not in the registry | Genuine no match |
+| F Car Park | Plate too blurred to read | Unreadable, no characters invented |
+
+### Plate formats
+
+Each camera has an explicit plate format: **Latin A-Z/0-9**, **India RTO/BH**, **UK**, or **Non-Latin, digits only**. The format limits which registry rows can be compared. It never fills in a character.
+
+The OCR alphabet is `A-Z` and `0-9`. For Thai, Arabic or other non-Latin plates, choose **Non-Latin, digits only**. Letters stay unknown, and only the longest numeric block is used.
+
+## Image evidence
+
+For each plate read, the pipeline keeps a lossless, read-only raw crop and creates labelled derivatives: perspective correction when four reliable corners exist, grayscale + CLAHE, denoised, restrained unsharp mask, and 2x and 4x interpolation.
+
+OCR runs on all views as a batch and keeps each slot's character probabilities. A character that appears only in processed views is marked as unsupported by source pixels and stays `?` unless another frame's raw crop supports it. Generative super-resolution is deliberately not used.
+
+Uploaded evidence is hashed and made read-only, and its hash is verified again before every analysis. Each run writes to a new artifact folder.
 
 ## Plate fusion
 
@@ -82,11 +104,19 @@ $$w_f = \text{ocr\_conf}_{f,i} \times \text{norm\_sharpness}_f \times \text{norm
 
 $$\text{conf}_i = P_i(c) \times \Bigl(1 - \prod_{f \in \text{support}(c)} (1 - \text{ocr\_conf}_{f,i})\Bigr)$$
 
-A slot is emitted as `?` when $\text{conf}_i < 0.55$, or when a single frame supports it below `0.78`. A multi-frame stack is shown and voted on, but it never counts as an independent frame. Generative super-resolution is deliberately not used because it can invent characters.
+A slot is emitted as `?`, with the reason stored, when any of these is true:
+
+- Fused confidence is below `0.55`, or a single frame supports it below `0.78`.
+- Repeated frames disagree on the character.
+- The character appears only after image processing.
+- Reads disagree about the plate's length, so its position is unreliable.
+- The position was seen in too few frames compared with its neighbours.
+
+A multi-frame stack is shown and voted on, but it never counts as an independent frame.
 
 ## Matching
 
-Plate evidence ranks vehicles first. Colour, body type and make/model only support a plate-based result.
+Plate evidence ranks vehicles first. Colour, body type and make/model only support a plate-based result. If OCR dropped a covered character, a short read can be compared with one or two *unknown* slots inserted, at a small penalty.
 
 $$S_\text{plate} = \text{clamp}\Bigl(\frac{\sum \text{contributions}}{\sum c}\Bigr) \times \gamma, \qquad \gamma = \frac{\text{known chars}}{\text{plate length}}$$
 
@@ -106,13 +136,12 @@ The **match score is an uncalibrated ranking value, not a probability**. It shou
 
 ## Cross-camera links
 
-The system only proposes links. A proposal needs one of these:
+The system only proposes links. A proposal needs compatible plate characters plus independent corroboration:
 
-- At least 5 consistent exact plate characters.
-- At least 4 consistent exact plate characters plus supporting visual similarity.
-- Strong visual similarity plus a plausible capture time on both clips.
+- At least 5 consistent exact characters, with visual similarity or a plausible capture time.
+- At least 4 consistent exact characters, with supporting visual similarity.
 
-Colour, body type and model can never create a link. High-confidence plate contradictions block a link. Missing capture time is shown as **not validated**. Plates are presented as unified only after an investigator confirms the link.
+Colour, body type, model and visual similarity alone never create a link. Plate contradictions, incompatible plate formats, overlapping sightings and impossible travel speed block a link. Missing capture time is shown as **not validated**. Plates are presented as unified only after an investigator confirms the link.
 
 ## Evaluation
 
@@ -120,18 +149,39 @@ Colour, body type and model can never create a link. High-confidence plate contr
 cd backend
 .venv/bin/python -m pytest
 .venv/bin/python scripts/evaluate_matcher.py --seed 7
+.venv/bin/python scripts/evaluate_pipeline.py --output ../docs/synthetic_pipeline_evaluation.json
 ```
 
-The benchmark uses **simulated OCR evidence** against the synthetic registry. It checks matcher logic, including whether out-of-registry vehicles are rejected. It does not measure real-world detection, OCR or identification accuracy.
+`evaluate_pipeline.py` renders labelled synthetic videos and runs them through the real detector, tracker, OCR, fusion, matcher and link logic. The set has 66 single-sighting cases (clear, partial, moving occlusion, ambiguous, unreadable and out-of-registry) plus 20 cross-camera sightings. Decision thresholds were not changed for this evaluation. Earlier seeds were used to find bugs, and the table reports the final unseen seed, `20261127`.
+
+| Metric | Result |
+| --- | ---: |
+| Top-1 accuracy (46 rankable cases) | 93.5% |
+| Top-5 recall | 97.8% |
+| MRR | 0.953 |
+| No-match precision | 85.7% |
+| No-match recall | 100% |
+| Promoted results | 31, with 0 wrong |
+| Emitted character precision | 99.1% (6 wrong of 642) |
+| Characters emitted on covered positions | 2 |
+| Cross-camera link precision | 80% (8 of 10 proposals) |
+| Cross-camera link recall | 80% (8 of 10 true pairs) |
+
+Full results are in [`docs/synthetic_pipeline_evaluation.json`](docs/synthetic_pipeline_evaluation.json).
+
+**These figures describe one synthetic fixture set, not real-world accuracy.** The fixtures reuse one recoloured vehicle photo, which makes visual re-identification unusually hard and plate rendering unusually clean. Recolourings that the stock detector does not see as a vehicle are excluded. The result still shows real failure modes: OCR occasionally emits a character on a covered position, and false link proposals occur, which is why every link requires investigator review.
 
 ## Known limitations
 
 - Matching accuracy has not been validated against a labelled real-world dataset, and no model was retrained on project data.
-- The default registry is synthetic, so real footage is expected to produce no true registry matches until a real registry is uploaded.
-- Plate script must be set by the operator, because automatic Thai-script detection was not reliable in testing.
+- The default registry is synthetic and contains only India RTO/BH-style plates. Real UK or Thai footage is expected to return no registry match until a matching registry is uploaded.
+- Plate format must be set by the operator, because automatic Thai-script detection was not reliable in testing.
+- OCR can be confidently wrong on degraded or partly covered plates. Multi-frame checks reduce this but do not eliminate it.
 - YOLOv8 uses COCO classes, so auto-rickshaws depend on the OpenCLIP refinement.
-- Colour, body type and make/model are approximate estimates.
-- OCR can be overconfident on heavily degraded plates.
+- Colour, body type and make/model are approximate estimates and are sometimes wrong.
+- The EasyOCR fallback is available only if its weights are already installed.
+- Earlier analysis runs keep their raw crops, so repeated analysis uses more disk space.
+- The Docker setup has not been run, and WeasyPrint needs native Pango libraries. Without them, PDFs use the ReportLab layout.
 - The API has no authentication. Add access control before any deployment beyond a local machine.
 
 ## Licensing
@@ -146,13 +196,13 @@ Ultralytics YOLO is distributed under AGPL-3.0 unless you hold an Ultralytics En
 | POST, GET | `/api/cases` | Create or list cases |
 | GET | `/api/cases/{id}` | Case detail and outcome summary |
 | POST | `/api/cases/{id}/clips` | Upload clips |
-| PATCH | `/api/cases/{id}/clips/{clip_id}` | Update capture time, location or plate script |
+| PATCH | `/api/cases/{id}/clips/{clip_id}` | Update capture time, timezone, location or plate format |
 | POST | `/api/cases/{id}/analyze` | Start the pipeline |
 | GET | `/api/cases/{id}/progress` | Live SSE progress |
 | GET | `/api/cases/{id}/vehicles[/{vehicle_id}]` | Tracks and evidence |
 | POST | `/api/cases/{id}/vehicles/{vehicle_id}/override` | Investigator override and re-rank |
 | POST | `/api/cases/{id}/entities/{entity_id}/review` | Confirm, reject or reopen a possible link |
-| GET | `/api/cases/{id}/report/html`, `/report/pdf?appendix=true` | Forensic reports |
+| GET | `/api/cases/{id}/report/html`, `/report/pdf?appendix=true&clip_id=` | Case or per-clip forensic reports |
 | GET | `/api/registry` | Search the registry |
 | POST | `/api/registry/upload` | Import CSV or JSON |
 | POST | `/api/registry/match-test` | Matcher sandbox |
