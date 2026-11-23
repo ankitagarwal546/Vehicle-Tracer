@@ -1,8 +1,8 @@
 """Cross-camera re-identification.
 
 The system only *proposes* links. A proposal needs independent evidence: consistent readable
-plate characters, or strong visual similarity with a plausible supplied time. Colour, body type
-and make/model can never create a link. An investigator confirms or rejects every proposal.
+plate characters corroborated by visual similarity or a plausible supplied time. Colour, body
+type and make/model can never create a link. An investigator confirms or rejects every proposal.
 """
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ from typing import NamedTuple
 import cv2
 import numpy as np
 
+from app.config import settings
 from app.cv.plate_fusion import UNKNOWN
 from app.engine.confusion_matrices import body_similarity, colour_similarity, is_confusable
 
@@ -34,8 +35,6 @@ MIN_PLATE_AGREEMENT = 0.90
 MIN_DISTINCT_CHARS = 3
 PARTIAL_MIN_VISUAL = 0.45
 PARTIAL_MIN_ATTRIBUTES = 0.50
-VISUAL_ONLY_MIN = 0.80
-VISUAL_ONLY_MIN_ATTRIBUTES = 0.60
 CONTRADICTION_MIN_COMPARED = 4
 CONTRADICTION_MAX_AGREEMENT = 0.70
 
@@ -53,6 +52,9 @@ class TrackProfile:
     start: datetime | None = None
     end: datetime | None = None
     location: str | None = None
+    latitude: float | None = None
+    longitude: float | None = None
+    plate_format: str = "latin_any"
     extra: dict = field(default_factory=dict)
 
 
@@ -167,9 +169,28 @@ def temporal_check(a: TrackProfile, b: TrackProfile) -> tuple[str, float, str]:
     if a.start <= b.end and b.start <= a.end:
         return "implausible", OVERLAP_TEMPORAL_FACTOR, "Implausible: sightings overlap in time at different cameras"
     gap = (max(a.start, b.start) - min(a.end, b.end)).total_seconds() / 3600
+    distance = haversine_km(a, b)
+    if distance is not None and gap > 0 and distance / gap > settings.max_plausible_speed_kmh:
+        return "implausible", OVERLAP_TEMPORAL_FACTOR, (
+            f"Implausible: {distance:.1f} km in {gap * 60:.1f} min needs {distance / gap:.0f} km/h")
+    if distance is not None:
+        return "plausible", 1.0, (f"Plausible: {distance:.1f} km in {gap * 60:.1f} min "
+                                  f"({distance / max(gap, 1e-6):.0f} km/h straight-line)")
     if gap > LONG_GAP_HOURS:
         return "weak", LONG_GAP_FACTOR, f"Weak: {gap:.1f} h between sightings"
     return "plausible", 1.0, f"Plausible order: {gap * 60:.1f} min between sightings (travel route not checked)"
+
+
+def haversine_km(a: TrackProfile, b: TrackProfile) -> float | None:
+    if None in (a.latitude, a.longitude, b.latitude, b.longitude):
+        return None
+    lat1, lon1, lat2, lon2 = map(np.radians, (a.latitude, a.longitude, b.latitude, b.longitude))
+    value = np.sin((lat2 - lat1) / 2) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin((lon2 - lon1) / 2) ** 2
+    return float(6371.0 * 2 * np.arcsin(np.sqrt(value)))
+
+
+def formats_compatible(a: str, b: str) -> bool:
+    return a == b or "latin_any" in (a, b)
 
 
 def temporal_factor(a: TrackProfile, b: TrackProfile) -> tuple[float, str]:
@@ -178,23 +199,23 @@ def temporal_factor(a: TrackProfile, b: TrackProfile) -> tuple[float, str]:
 
 
 def _evidence_tier(overlap: PlateOverlap | None, visual: float, attributes: float | None,
-                   temporal: str) -> tuple[str | None, str]:
+                   temporal: str, compatible_formats: bool = True) -> tuple[str | None, str]:
+    """Plate agreement is mandatory, and must be corroborated by visual or time evidence."""
+    if not compatible_formats:
+        return None, "cameras use different plate formats"
     if overlap and overlap.compared >= CONTRADICTION_MIN_COMPARED and overlap.contradictions >= 2 \
             and overlap.agreement < CONTRADICTION_MAX_AGREEMENT:
         return None, "plate characters contradict each other"
+    if not overlap:
+        return None, "no overlapping plate characters to corroborate a link"
+    if temporal == "implausible":
+        return None, "plate overlap exists but the sightings are implausible in time or distance"
     attributes_ok = attributes is None or attributes >= PARTIAL_MIN_ATTRIBUTES
-    if overlap and overlap.agreement >= MIN_PLATE_AGREEMENT and overlap.distinct >= MIN_DISTINCT_CHARS:
-        if overlap.exact >= STRONG_PLATE_EXACT:
-            if temporal == "implausible":
-                return None, "plate agrees but the sightings overlap in time"
-            return "strong_plate", "consistent readable plate characters"
+    if overlap.agreement >= MIN_PLATE_AGREEMENT and overlap.distinct >= MIN_DISTINCT_CHARS:
+        if overlap.exact >= STRONG_PLATE_EXACT and (visual >= PARTIAL_MIN_VISUAL or temporal == "plausible"):
+            return "strong_plate", "consistent plate characters with visual or time corroboration"
         if overlap.exact >= PARTIAL_PLATE_EXACT and visual >= PARTIAL_MIN_VISUAL and attributes_ok:
-            if temporal == "implausible":
-                return None, "partial plate agrees but the sightings overlap in time"
             return "partial_plate", "partial plate overlap with supporting visual similarity"
-    if visual >= VISUAL_ONLY_MIN and temporal == "plausible" \
-            and (attributes is None or attributes >= VISUAL_ONLY_MIN_ATTRIBUTES):
-        return "visual_time", "strong visual similarity with a plausible capture time"
     return None, "insufficient independent evidence"
 
 
@@ -209,7 +230,8 @@ def pair_similarity(a: TrackProfile, b: TrackProfile) -> dict:
     total = sum(weight for weight, _ in active.values())
     base = sum(weight * value for weight, value in active.values()) / total
     status, factor, note = temporal_check(a, b)
-    tier, tier_reason = _evidence_tier(overlap, visual, attributes, status)
+    compatible = formats_compatible(a.plate_format, b.plate_format)
+    tier, tier_reason = _evidence_tier(overlap, visual, attributes, status, compatible)
     return {
         "a": a.vehicle_id, "b": b.vehicle_id, "score": round(base * factor, 4),
         "visual": round(visual, 4), "plate": None if plate is None else round(plate, 4),
@@ -233,7 +255,7 @@ def link_tracks(profiles: list[TrackProfile]) -> LinkResult:
         for b in profiles[index + 1:]
         if a.clip_id != b.clip_id
     ]
-    tier_rank = {"strong_plate": 0, "partial_plate": 1, "visual_time": 2}
+    tier_rank = {"strong_plate": 0, "partial_plate": 1}
     eligible = sorted((p for p in pairs if p["evidence_tier"]),
                       key=lambda p: (tier_rank[p["evidence_tier"]], -p["score"]))
     blocked = sum(p["plate_conflict"] for p in pairs)

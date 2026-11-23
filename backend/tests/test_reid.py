@@ -51,12 +51,36 @@ def test_attributes_and_visual_without_time_never_create_a_link():
     assert link_tracks([profile("a", "c1", unit(1, 0, 0)), profile("b", "c2", unit(1, 0, 0))]).groups == []
 
 
-def test_strong_visual_with_plausible_time_is_proposed():
+def test_visual_similarity_with_time_but_no_plate_is_not_a_link():
     start = datetime(2026, 1, 1, tzinfo=timezone.utc)
     a = profile("a", "c1", unit(1, 0, 0), start=start)
     b = profile("b", "c2", unit(1, 0, 0), start=start + timedelta(minutes=5))
     result = link_tracks([a, b])
-    assert result.groups == [["a", "b"]] and result.links[0]["evidence_tier"] == "visual_time"
+    assert result.groups == [] and pair_similarity(a, b)["evidence_tier"] is None
+
+
+def test_plate_plus_plausible_time_is_a_link():
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    a = profile("a", "c1", unit(1, 0, 0), "MH12DE1433", start=start)
+    b = profile("b", "c2", unit(0, 1, 0), "MH12DE1433", start=start + timedelta(minutes=5))
+    result = link_tracks([a, b])
+    assert result.groups == [["a", "b"]] and result.links[0]["evidence_tier"] == "strong_plate"
+
+
+def test_impossible_travel_speed_vetoes_link():
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    a = profile("a", "c1", unit(1, 0, 0), "MH12DE1433", start=start)
+    b = profile("b", "c2", unit(1, 0, 0), "MH12DE1433", start=start + timedelta(minutes=5))
+    a.latitude, a.longitude, b.latitude, b.longitude = 18.5, 73.8, 28.6, 77.2
+    pair = pair_similarity(a, b)
+    assert pair["temporal_status"] == "implausible" and pair["evidence_tier"] is None
+
+
+def test_different_plate_formats_veto_link():
+    a = profile("a", "c1", unit(1, 0, 0), "AB12CDE")
+    b = profile("b", "c2", unit(1, 0, 0), "AB12CDE")
+    a.plate_format, b.plate_format = "uk", "india_rto"
+    assert link_tracks([a, b]).groups == []
 
 
 def test_implausible_time_blocks_visual_link():

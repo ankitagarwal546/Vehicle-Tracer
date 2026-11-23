@@ -38,13 +38,14 @@ class SampledFrame:
     sharpness: float
     brightness: float
     contrast: float
+    low_sharpness: bool = False
 
 
 @dataclass
 class SamplingStats:
     windows: int = 0
     kept: int = 0
-    rejected_blur: int = 0
+    retained_blurry: int = 0
     rejected_exposure: int = 0
     rejected_contrast: int = 0
     rejected_static: int = 0
@@ -52,7 +53,7 @@ class SamplingStats:
 
     def as_dict(self) -> dict:
         return {
-            "windows": self.windows, "kept": self.kept, "rejected_blur": self.rejected_blur,
+            "windows": self.windows, "kept": self.kept, "retained_blurry": self.retained_blurry,
             "rejected_exposure": self.rejected_exposure, "rejected_contrast": self.rejected_contrast,
             "rejected_static": self.rejected_static,
         }
@@ -170,9 +171,9 @@ def sample_frames(
         if contrast < settings.min_contrast:
             stats.rejected_contrast += 1
             return None
-        if sharp < settings.min_sharpness:
-            stats.rejected_blur += 1
-            return None
+        # A blurry frame may hold the only view of a plate, so flag it and rank it lower.
+        low_sharpness = sharp < settings.min_sharpness
+        stats.retained_blurry += low_sharpness
         timestamp = frame_idx / metadata.fps
         small = cv2.resize(gray, (160, 90), interpolation=cv2.INTER_AREA)
         if previous is not None and float(cv2.absdiff(small, previous).mean()) < STATIC_DIFF \
@@ -181,7 +182,7 @@ def sample_frames(
             return None
         previous, last_kept_ts = small, timestamp
         stats.kept += 1
-        return SampledFrame(frame_idx, timestamp, image, sharp, brightness, contrast)
+        return SampledFrame(frame_idx, timestamp, image, sharp, brightness, contrast, low_sharpness)
 
     for index, frame in _raw_frames(path, metadata):
         sharp = sharpness_score(cv2.resize(frame, (320, int(320 * frame.shape[0] / frame.shape[1]))))

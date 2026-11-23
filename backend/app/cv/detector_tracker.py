@@ -15,6 +15,7 @@ import numpy as np
 
 from app.config import settings
 from app.cv.device import active_device
+from app.cv.model_assets import ModelsNotInstalled, yolo_weights_name
 from app.cv.track_stitcher import StitchDecision
 from app.cv.video_processor import SampledFrame, sharpness_score
 
@@ -45,6 +46,10 @@ class TrackObservation:
     lower_occlusion: float = 0.0
     occluders_in_crop: list[tuple[int, int, int, int]] = field(default_factory=list)
     target_in_crop: tuple[int, int, int, int] = (0, 0, 0, 0)
+    frame_sharpness: float = 0.0
+    frame_brightness: float = 0.0
+    frame_contrast: float = 0.0
+    low_sharpness: bool = False
 
 
 @dataclass
@@ -156,10 +161,13 @@ class VehicleDetectorTracker:
 
         self.device = active_device()
         accelerated = self.device != "cpu"
-        name = settings.yolo_model if settings.yolo_model != "auto" else ("yolov8s.pt" if accelerated else "yolov8n.pt")
+        name = yolo_weights_name()
         self.weights_name = name
         self.imgsz = settings.yolo_imgsz or (960 if accelerated else 640)
-        self.model = YOLO(str(settings.model_dir / name))
+        weights = settings.model_dir / name
+        if not weights.exists() and not settings.allow_model_download:
+            raise ModelsNotInstalled(f"{name} is not installed. Run scripts/download_models.py.")
+        self.model = YOLO(str(weights))
         self._lock = threading.Lock()
 
     def _track(self, image: np.ndarray):
@@ -230,6 +238,7 @@ class VehicleDetectorTracker:
                 TrackObservation(frame.frame_idx, frame.timestamp_sec, (x1, y1, x2, y2), float(conf),
                                  sharpness_score(crop), crop, frame_jpeg, scene_scale, truncated,
                                  lower_occlusion(xyxy, in_front), occluders,
-                                 (x1 - cx1, y1 - cy1, x2 - cx1, y2 - cy1)),
+                                 (x1 - cx1, y1 - cy1, x2 - cx1, y2 - cy1), frame.sharpness, frame.brightness,
+                                 frame.contrast, frame.low_sharpness),
                 COCO_VEHICLES[int(cls)], float(conf),
             )

@@ -83,8 +83,9 @@ def test_fused_plate_never_exceeds_slot_limit():
 
 
 def test_digits_only_withholds_letters_from_unsupported_scripts():
-    fused = fuse_plate_reads([read(1, "1DU4714"), read(2, "10U4714")], digits_only=True)
-    assert fused.text == "4714"
+    fused = fuse_plate_reads([read(1, "1AB9876"), read(2, "10B9876")], digits_only=True)
+    assert fused.text == "???9876"
+    assert fused.slots[0].unknown_reason.startswith("withheld")
 
 
 def test_derived_stack_is_not_counted_as_independent_frames():
@@ -92,3 +93,50 @@ def test_derived_stack_is_not_counted_as_independent_frames():
     single = PlateRead(1, 0.2, "MH12DE1433", [0.7] * 10, 100, 1000, 0.7)
     fused = fuse_plate_reads([single, stacked])
     assert fused.text == "?" * 10
+
+
+def test_repeated_conflicting_frames_emit_unknown_with_reason():
+    fused = fuse_plate_reads([read(1, "MH12DE1433"), read(2, "MH12DE1433"), read(3, "MH12DE1433"),
+                              read(4, "MH12DE1439"), read(5, "MH12DE1439")])
+    assert fused.text == "MH12DE143?"
+    assert "disagree" in fused.slots[9].unknown_reason
+    assert {c for c, _ in fused.slots[9].candidates} == {"3", "9"}
+
+
+def test_character_only_in_processed_variants_stays_unknown():
+    processed = PlateRead(1, 0.2, "MH12DE1433", [0.95] * 10, 100, 1000, 0.95,
+                          char_source_supported=[True] * 9 + [False])
+    fused = fuse_plate_reads([processed])
+    assert fused.text == "MH12DE143?"
+    assert "image processing" in fused.slots[9].unknown_reason
+
+
+def test_other_frame_source_pixels_can_support_processed_character():
+    processed = PlateRead(1, 0.2, "MH12DE1433", [0.95] * 10, 100, 1000, 0.95,
+                          char_source_supported=[True] * 9 + [False])
+    fused = fuse_plate_reads([processed, read(2, "MH12DE1433", 0.9)])
+    assert fused.text == "MH12DE1433" and fused.slots[9].source_supported_frames == 1
+
+
+def test_reads_with_conflicting_length_keep_only_agreed_positions():
+    fused = fuse_plate_reads([read(1, "TN09WA4"), read(2, "TN09WA4"), read(3, "9WA43330"), read(4, "9WA43330")])
+    assert len(fused.slots) <= 10
+    assert any("plate length" in (slot.unknown_reason or "") for slot in fused.slots)
+    assert "4333" not in fused.text
+
+
+def test_read_that_saw_a_dropped_character_opens_its_slot():
+    fused = fuse_plate_reads([read(1, "UP16R4569"), read(2, "UP16R4569"), read(3, "UP16RX4569"),
+                              read(4, "UP16RX4569")])
+    assert fused.text == "UP16RX4569"
+
+
+def test_rare_edge_character_is_removed_as_ocr_artefact():
+    reads = [read(i, "QX51TKU") for i in range(1, 11)] + [read(11, "HQX51TKU")]
+    assert fuse_plate_reads(reads).text == "QX51TKU"
+
+
+def test_single_frame_insertion_does_not_add_a_plate_position():
+    reads = [read(i, "ZR61QKT") for i in range(1, 11)] + [read(11, "ZR61QPKT")]
+    fused = fuse_plate_reads(reads)
+    assert fused.text == "ZR61QKT" and len(fused.slots) == 7

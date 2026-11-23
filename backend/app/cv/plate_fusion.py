@@ -32,6 +32,9 @@ MIN_READ_IDENTITY = 0.55
 CONFUSABLE_IDENTITY = 0.7
 FULL_PLATE_SLOTS = 9
 MAX_SLOT_EVIDENCE = 12
+CONFLICT_RUNNER_UP = 0.25
+MIN_CONFLICT_FRAMES = 2
+MIN_SLOT_OBSERVATION_SHARE = 0.3
 
 
 @dataclass
@@ -45,6 +48,22 @@ class PlateRead:
     ocr_engine_score: float = 1.0
     source: str = ""
     derived: bool = False  # A multi-frame stack repeats frames, so it is not independent evidence.
+    char_alternatives: list[list[tuple[str, float]]] = field(default_factory=list)
+    char_source_supported: list[bool] = field(default_factory=list)
+    char_variants: list[list[dict]] = field(default_factory=list)
+    ocr_engine: str = ""
+    crop: str | None = None
+    crop_sha256: str | None = None
+    withheld: frozenset[int] = frozenset()
+
+    def alternatives_at(self, index: int) -> list[tuple[str, float]]:
+        return self.char_alternatives[index] if index < len(self.char_alternatives) else []
+
+    def source_supported_at(self, index: int) -> bool:
+        return self.char_source_supported[index] if index < len(self.char_source_supported) else True
+
+    def variants_at(self, index: int) -> list[dict]:
+        return self.char_variants[index] if index < len(self.char_variants) else []
 
 
 @dataclass
@@ -54,6 +73,12 @@ class SlotVote:
     char: str
     confidence: float
     source: str
+    source_supported: bool = True
+    alternatives: list[tuple[str, float]] = field(default_factory=list)
+    variants: list[dict] = field(default_factory=list)
+    crop: str | None = None
+    crop_sha256: str | None = None
+    ocr_engine: str = ""
 
 
 @dataclass
@@ -65,6 +90,8 @@ class FusedSlot:
     support_frames: int
     observed_frames: int
     evidence: list[SlotVote] = field(default_factory=list)
+    unknown_reason: str | None = None
+    source_supported_frames: int = 0
 
 
 @dataclass
@@ -106,9 +133,15 @@ class FusedPlate:
                     "candidates": [{"char": c, "probability": round(p, 4)} for c, p in s.candidates],
                     "support_frames": s.support_frames,
                     "observed_frames": s.observed_frames,
+                    "source_supported_frames": s.source_supported_frames,
+                    "unknown_reason": s.unknown_reason,
                     "evidence": [
                         {"frame_idx": v.frame_idx, "timestamp_sec": round(v.timestamp_sec, 3), "char": v.char,
-                         "confidence": round(v.confidence, 4), "source": v.source}
+                         "confidence": round(v.confidence, 4), "source": v.source,
+                         "source_supported": v.source_supported, "ocr_engine": v.ocr_engine, "crop": v.crop,
+                         "crop_sha256": v.crop_sha256,
+                         "alternatives": [{"char": c, "probability": round(p, 4)} for c, p in v.alternatives],
+                         "variants": v.variants}
                         for v in s.evidence[:MAX_SLOT_EVIDENCE]
                     ],
                 }
@@ -181,22 +214,27 @@ def _rejection(read: PlateRead, reason: str) -> dict:
 def _clean(read: PlateRead, digits_only: bool = False) -> tuple[PlateRead | None, str | None]:
     chars: list[str] = []
     confidences: list[float] = []
+    kept: list[int] = []
     raw = read.raw_text.upper()
     source = read.char_confidences if len(read.char_confidences) == len(raw) else [read.ocr_engine_score] * len(raw)
-    for char, confidence in zip(raw, source):
+    for index, (char, confidence) in enumerate(zip(raw, source)):
         if char.isalnum() and char.isascii():
             keep = confidence >= MIN_CHAR_CONFIDENCE
             chars.append(char if keep else UNKNOWN)
             confidences.append(float(confidence) if keep else 0.0)
+            kept.append(index)
         elif char == UNKNOWN:
             chars.append(UNKNOWN)
             confidences.append(0.0)
+            kept.append(index)
+    withheld: set[int] = set()
     if digits_only:
         # OCR can render a foreign letter as a digit, so trust only the longest numeric block.
         block = max(re.finditer(r"[0-9]+", "".join(chars)), key=lambda m: len(m.group()), default=None)
-        keep = range(block.start(), block.end()) if block else range(0)
-        chars = [char if i in keep else UNKNOWN for i, char in enumerate(chars)]
-        confidences = [conf if i in keep else 0.0 for i, conf in enumerate(confidences)]
+        allowed = range(block.start(), block.end()) if block else range(0)
+        withheld = {i for i, char in enumerate(chars) if i not in allowed}
+        chars = [UNKNOWN if i in withheld else char for i, char in enumerate(chars)]
+        confidences = [0.0 if i in withheld else conf for i, conf in enumerate(confidences)]
     known = [(char, conf) for char, conf in zip(chars, confidences) if char != UNKNOWN]
     if not MIN_READ_LENGTH <= len(chars) <= MAX_READ_LENGTH:
         return None, "length outside plausible plate range"
@@ -206,8 +244,18 @@ def _clean(read: PlateRead, digits_only: bool = False) -> tuple[PlateRead | None
         return None, "read confidence too low"
     if len(known) >= 5 and Counter(c for c, _ in known).most_common(1)[0][1] / len(known) >= MAX_REPEAT_SHARE:
         return None, "repeated-character OCR artefact"
-    return PlateRead(read.frame_idx, read.timestamp_sec, "".join(chars), confidences, read.sharpness_score,
-                     read.bbox_area, read.ocr_engine_score, read.source, read.derived), None
+    return PlateRead(
+        read.frame_idx, read.timestamp_sec, "".join(chars), confidences, read.sharpness_score, read.bbox_area,
+        read.ocr_engine_score, read.source, read.derived,
+        [[] if k in withheld_positions(kept, withheld) else read.alternatives_at(k) for k in kept],
+        [read.source_supported_at(k) for k in kept],
+        [read.variants_at(k) for k in kept],
+        read.ocr_engine, read.crop, read.crop_sha256, frozenset(withheld),
+    ), None
+
+
+def withheld_positions(kept: list[int], withheld: set[int]) -> set[int]:
+    return {kept[i] for i in withheld}
 
 
 def _normalise(values: list[float]) -> list[float]:
@@ -266,9 +314,9 @@ def fuse_plate_reads(
 
     # Each column stores (read, char, confidence, weight), so a slot never loses its source frame.
     seed = ordered[0]
-    columns: list[list[tuple[PlateRead, str, float, float]]] = [
-        [(seed, ch, conf, conf * frame_weight[id(seed)])]
-        for ch, conf in list(zip(seed.raw_text, seed.char_confidences))[:MAX_PLATE_SLOTS]
+    columns: list[list[tuple[PlateRead, str, float, float, int]]] = [
+        [(seed, ch, conf, conf * frame_weight[id(seed)], index)]
+        for index, (ch, conf) in enumerate(list(zip(seed.raw_text, seed.char_confidences))[:MAX_PLATE_SLOTS])
     ]
     if len(seed.raw_text) > MAX_PLATE_SLOTS:
         rejected.append(_rejection(seed, f"characters beyond slot {MAX_PLATE_SLOTS} ignored"))
@@ -277,12 +325,15 @@ def fuse_plate_reads(
         output = []
         for column in columns:
             tally: dict[str, float] = defaultdict(float)
-            for _, char, _, weight in column:
+            for _, char, _, weight, _ in column:
                 if char != UNKNOWN:
                     tally[char] += weight
             output.append(max(sorted(tally), key=tally.get) if tally else UNKNOWN)
         return "".join(output)
 
+    # When reads cannot share one plate-length frame, OCR has inserted or dropped a character.
+    # Only columns that the conflicting reads align on remain reliable.
+    trusted_columns: set[int] | None = None
     used = 1
     for read in ordered[1:]:
         reference = consensus()
@@ -292,6 +343,16 @@ def fuse_plate_reads(
             rejected.append(_rejection(read, "does not align with the other frames"))
             continue
         used += 1
+        # If an earlier read dropped a character that this read saw, open a slot for it.
+        missing = sum(
+            max((later_index - index - 1) - (later_ref - ref - 1), 0)
+            for (ref, index), (later_ref, later_index) in zip(pairs, pairs[1:])
+        )
+        if missing and len(columns) + missing <= MAX_PLATE_SLOTS:
+            for (ref, index), (later_ref, later_index) in reversed(list(zip(pairs, pairs[1:]))):
+                for _ in range(max((later_index - index - 1) - (later_ref - ref - 1), 0)):
+                    columns.insert(ref + 1, [])
+            pairs = align(consensus(), read.raw_text)
         first_ref, first_read = pairs[0]
         last_ref, last_read = pairs[-1]
         placed = {index: ref for ref, index in pairs}
@@ -304,6 +365,15 @@ def fuse_plate_reads(
             elif index > last_read:
                 targets[index] = last_ref + (index - last_read)
         lowest = min(targets.values())
+        highest = max(targets.values())
+        if max(highest, len(columns) - 1) - min(lowest, 0) + 1 > MAX_PLATE_SLOTS:
+            agreed = {id(columns[ref]) for ref, index in pairs if read.raw_text[index] != UNKNOWN}
+            trusted_columns = agreed if trusted_columns is None else trusted_columns & agreed
+            for ref, index in pairs:
+                columns[ref].append((read, read.raw_text[index], read.char_confidences[index],
+                                     read.char_confidences[index] * frame_weight[id(read)], index))
+            rejected.append(_rejection(read, "characters outside the plate frame ignored; read lengths conflict"))
+            continue
         room = MAX_PLATE_SLOTS - len(columns)
         prepend = min(max(-lowest, 0), max(room, 0))
         if prepend:
@@ -315,24 +385,37 @@ def fuse_plate_reads(
             while target >= len(columns):
                 columns.append([])
             columns[target].append((read, read.raw_text[index], read.char_confidences[index],
-                                    read.char_confidences[index] * frame_weight[id(read)]))
+                                    read.char_confidences[index] * frame_weight[id(read)], index))
 
     slots: list[FusedSlot] = []
     for position, column in enumerate(columns):
         tally: dict[str, float] = defaultdict(float)
         confidences: dict[str, list[float]] = defaultdict(list)
+        source_votes: dict[str, int] = defaultdict(int)
         votes: list[SlotVote] = []
-        for read, char, conf, weight in column:
+        withheld_votes = 0
+        for read, char, conf, weight, index in column:
             if char == UNKNOWN:
+                withheld_votes += index in read.withheld
                 continue
+            supported = read.source_supported_at(index) and not read.derived
             tally[char] += weight
-            votes.append(SlotVote(read.frame_idx, read.timestamp_sec, char, conf, read.source))
+            for alternative, probability in read.alternatives_at(index):
+                tally[alternative] += probability * frame_weight[id(read)]
+            votes.append(SlotVote(read.frame_idx, read.timestamp_sec, char, conf, read.source, supported,
+                                  read.alternatives_at(index), read.variants_at(index), read.crop, read.crop_sha256,
+                                  read.ocr_engine))
             if not read.derived:
                 confidences[char].append(conf)
+                source_votes[char] += supported
         total = sum(tally.values())
         observed = sum(len(items) for items in confidences.values())
         if total <= 0 or observed == 0:
-            slots.append(FusedSlot(position, UNKNOWN, 0.0, [], 0, 0, votes))
+            reason = "withheld: plate script cannot be read by the OCR alphabet" if withheld_votes \
+                else "not visible in any usable frame"
+            slots.append(FusedSlot(position, UNKNOWN, 0.0, [], 0, 0, votes, reason, 0))
+            if withheld_votes:
+                slots[-1].observed_frames = -withheld_votes  # Kept in place, then normalised below.
             continue
         ranked = sorted(((char, value / total) for char, value in tally.items()), key=lambda x: (-x[1], x[0]))
         winner, posterior = ranked[0]
@@ -341,11 +424,41 @@ def fuse_plate_reads(
         for conf in confidences[winner]:
             miss *= 1.0 - conf
         fused = posterior * (1.0 - miss)
-        passes = support > 0 and fused >= tau and (support >= 2 or max(confidences[winner]) >= single_min)
-        if passes:
-            slots.append(FusedSlot(position, winner, fused, ranked[1:3], support, observed, votes))
+        reason: str | None = None
+        if trusted_columns is not None and id(column) not in trusted_columns:
+            reason = "frames disagree about plate length, so this position is not reliable"
+        elif support == 0:
+            reason = "best reading appears only in a derived multi-frame view"
+        elif source_votes[winner] == 0:
+            reason = "best reading appears only after image processing, not in source pixels"
+        elif len(ranked) > 1 and ranked[1][1] >= CONFLICT_RUNNER_UP \
+                and (fused < tau or len(confidences.get(ranked[1][0], [])) >= MIN_CONFLICT_FRAMES):
+            reason = f"frames disagree between {winner} and {ranked[1][0]}"
+        elif fused < tau:
+            reason = f"fused confidence {fused:.2f} is below {tau:.2f}"
+        elif support < 2 and max(confidences[winner]) < single_min:
+            reason = f"seen in one frame at {max(confidences[winner]):.2f}, below {single_min:.2f}"
+        if reason is None:
+            slots.append(FusedSlot(position, winner, fused, ranked[1:3], support, observed, votes, None,
+                                   source_votes[winner]))
         else:
-            slots.append(FusedSlot(position, UNKNOWN, fused, ranked[:2], support, observed, votes))
+            slots.append(FusedSlot(position, UNKNOWN, fused, ranked[:2], support, observed, votes, reason,
+                                   source_votes[winner]))
+
+    # A position seen by only a few frames next to well-observed positions is usually an OCR
+    # insertion or a plate border. Removing it keeps one bad frame from shifting the whole plate.
+    if len(slots) > 1:
+        peak = max(slot.observed_frames for slot in slots)
+        keep = [i for i, slot in enumerate(slots)
+                if not 0 < slot.observed_frames < MIN_SLOT_OBSERVATION_SHARE * peak]
+        if keep and len(keep) < len(slots):
+            removed = [i for i in range(len(slots)) if i not in keep]
+            for index in removed:
+                for read, char, _, _, _ in columns[index]:
+                    if char != UNKNOWN:
+                        rejected.append(_rejection(read, f"character {char} ignored: position seen in too few frames"))
+            slots = [slots[i] for i in keep]
+            columns = [columns[i] for i in keep]
 
     while slots and slots[0].observed_frames == 0:
         slots.pop(0)
@@ -355,15 +468,19 @@ def fuse_plate_reads(
         columns.pop()
     for index, slot in enumerate(slots):
         slot.position = index
+        slot.observed_frames = max(slot.observed_frames, 0)
 
     by_read: dict[int, dict] = {}
     for position, column in enumerate(columns):
-        for read, char, conf, _ in column:
+        for read, char, conf, _, _ in column:
             row = by_read.setdefault(id(read), {
                 "frame_idx": read.frame_idx,
                 "timestamp_sec": round(read.timestamp_sec, 3),
                 "raw_text": read.raw_text,
                 "source": read.source,
+                "ocr_engine": read.ocr_engine,
+                "crop": read.crop,
+                "crop_sha256": read.crop_sha256,
                 "derived": read.derived,
                 "sharpness": round(read.sharpness_score, 2),
                 "cells": [{"char": UNKNOWN, "confidence": 0.0} for _ in columns],

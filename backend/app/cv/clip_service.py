@@ -10,6 +10,7 @@ from PIL import Image
 
 from app.config import settings
 from app.cv.device import active_device
+from app.cv.model_assets import ModelsNotInstalled, clip_weights_path
 
 logger = logging.getLogger(__name__)
 LOGIT_SCALE = 100.0
@@ -28,8 +29,11 @@ class ClipService:
 
             self.torch = torch
             self.device = active_device()
+            weights = clip_weights_path()
+            if weights is None and not settings.allow_model_download:
+                raise ModelsNotInstalled("OpenCLIP weights are not installed. Run scripts/download_models.py.")
             model, _, preprocess = open_clip.create_model_and_transforms(
-                settings.clip_model, pretrained=settings.clip_pretrained
+                settings.clip_model, pretrained=weights or settings.clip_pretrained
             )
             self.model = model.to(self.device).eval()
             self.preprocess = preprocess

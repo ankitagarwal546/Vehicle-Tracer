@@ -3,7 +3,14 @@ import numpy as np
 import pytest
 
 from app.cv.attributes import estimate_colour, gray_world
-from app.cv.plate_ocr import enhance_plate, plate_belongs_to_target, stack_plates, trim_country_band
+from app.cv.plate_ocr import (
+    OcrOutput,
+    combine_variants,
+    plate_belongs_to_target,
+    stack_plates,
+    trim_country_band,
+)
+from app.cv.plate_variants import build_variants, rectify_plate
 from app.cv.video_processor import sharpness_score
 
 
@@ -43,13 +50,47 @@ def test_white_vehicle_recovers_under_sodium_light_with_scene_context():
     assert estimate_colour([crop], scenes=[scene])[0]["label"] in {"white", "silver"}
 
 
-def test_enhancement_upscales_and_adds_detail():
+def test_variants_are_traceable_and_do_not_modify_raw():
     plate = np.full((30, 120, 3), 225, dtype=np.uint8)
     cv2.putText(plate, "MH12", (6, 23), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (20, 20, 20), 2)
-    blurred = cv2.GaussianBlur(plate, (5, 5), 1.2)
-    enhanced = enhance_plate(blurred)
-    assert enhanced.shape[0] >= 60 and enhanced.shape[1] >= 240
-    assert sharpness_score(cv2.resize(enhanced, (120, 30), interpolation=cv2.INTER_AREA)) > sharpness_score(blurred)
+    original = plate.copy()
+    views, rectification = build_variants(plate)
+    assert np.array_equal(plate, original) and np.array_equal(views["raw"], original)
+    assert {"raw", "gray_clahe", "denoised", "unsharp", "upscale_2x", "upscale_4x"} <= set(views)
+    assert views["upscale_2x"].shape[:2] == (60, 240) and views["upscale_4x"].shape[:2] == (120, 480)
+    assert rectification.status in {"applied", "not_needed", "unavailable"}
+
+
+def test_perspective_is_applied_only_from_reliable_corners():
+    canvas = np.zeros((90, 300, 3), dtype=np.uint8)
+    quad = np.array([[12, 10], [286, 20], [282, 78], [8, 70]], np.int32)
+    cv2.fillConvexPoly(canvas, quad, (235, 235, 235))
+    warped, result = rectify_plate(canvas)
+    assert result.status == "applied" and warped is not None
+    noise = np.random.default_rng(0).integers(0, 255, (60, 200, 3), dtype=np.uint8)
+    warped, result = rectify_plate(noise)
+    assert warped is None and result.status in {"unavailable", "not_needed"} and result.reason
+
+
+def test_character_seen_only_after_processing_is_not_source_supported():
+    outputs = {
+        "raw": OcrOutput("MH12", [0.9, 0.9, 0.9, 0.6]),
+        "gray_clahe": OcrOutput("MH18", [0.9, 0.9, 0.9, 0.95]),
+        "denoised": OcrOutput("MH18", [0.9, 0.9, 0.9, 0.95]),
+        "unsharp": OcrOutput("MH18", [0.9, 0.9, 0.9, 0.95]),
+        "upscale_2x": OcrOutput("MH18", [0.9, 0.9, 0.9, 0.95]),
+    }
+    combined = combine_variants(outputs)
+    assert combined.text == "MH18"
+    assert combined.source_supported == [True, True, True, False]
+    assert combined.confidences[3] < 0.5
+
+
+def test_runner_up_in_raw_counts_as_source_support():
+    raw = OcrOutput("MH12", [0.9, 0.9, 0.9, 0.5], [[], [], [], [("8", 0.4)]])
+    combined = combine_variants({"raw": raw, "upscale_2x": OcrOutput("MH18", [0.9, 0.9, 0.9, 0.9]),
+                                 "upscale_4x": OcrOutput("MH18", [0.9, 0.9, 0.9, 0.9])})
+    assert combined.text == "MH18" and combined.source_supported[3] is True
 
 
 def test_plate_ownership_rejects_plate_on_nearer_vehicle():
@@ -75,3 +116,14 @@ def test_stacking_reduces_noise_without_inventing_structure():
     assert stacked is not None
     target = cv2.resize(clean, (stacked.shape[1], stacked.shape[0]), interpolation=cv2.INTER_CUBIC).astype(float)
     assert np.abs(stacked - target).mean() < np.abs(cv2.resize(noisy[0], (stacked.shape[1], stacked.shape[0])) - target).mean()
+
+
+
+def test_ocr_spacer_is_not_a_character_or_unknown_slot():
+    from app.cv.plate_ocr import _decode_slots
+
+    alphabet = "AB1_"
+    slots = np.array([[0.9, 0.05, 0.03, 0.02], [0.02, 0.03, 0.05, 0.9], [0.05, 0.9, 0.03, 0.02],
+                      [0.02, 0.03, 0.05, 0.9]])
+    decoded = _decode_slots(slots, alphabet, "_")
+    assert decoded.text == "AB" and len(decoded.confidences) == 2
