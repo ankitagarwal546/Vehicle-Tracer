@@ -1,0 +1,8 @@
+# ByteTrack tuned for low-FPS forensic sampling, where vehicles stop and are often occluded.
+tracker_type: bytetrack
+track_high_thresh: 0.3
+track_low_thresh: 0.1
+new_track_thresh: 0.4
+track_buffer: 36
+match_thresh: 0.85
+fuse_score: True

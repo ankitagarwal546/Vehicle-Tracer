@@ -59,3 +59,36 @@ def test_empty_input():
 def test_alignment_handles_offset():
     pairs = align("MH12DE1433", "DE14")
     assert pairs == [(4, 0), (5, 1), (6, 2), (7, 3)]
+
+
+def test_slots_keep_source_frame_evidence():
+    fused = fuse_plate_reads([read(12, "MH12DE1433"), read(18, "MH12DE1433")])
+    assert {vote.frame_idx for vote in fused.slots[0].evidence} == {12, 18}
+    assert fused.to_dict()["slots"][0]["evidence"][0]["char"] == "M"
+
+
+def test_repeated_character_ocr_artefact_is_rejected():
+    fused = fuse_plate_reads([read(1, "WWWWWWW"), read(2, "WWWWWW")])
+    assert fused.text == "" and fused.reads_rejected == 2
+
+
+def test_unrelated_read_cannot_extend_plate():
+    fused = fuse_plate_reads([read(1, "MH12DE1433"), read(2, "MH12DE1433"), read(3, "QWXYZK7788")])
+    assert fused.text == "MH12DE1433" and fused.reads_rejected == 1
+
+
+def test_fused_plate_never_exceeds_slot_limit():
+    fused = fuse_plate_reads([read(1, "ABCDEFGHJK"), read(2, "EFGHJKLMNP"), read(3, "HJKLMNPRST")])
+    assert len(fused.slots) <= 10
+
+
+def test_digits_only_withholds_letters_from_unsupported_scripts():
+    fused = fuse_plate_reads([read(1, "1DU4714"), read(2, "10U4714")], digits_only=True)
+    assert fused.text == "4714"
+
+
+def test_derived_stack_is_not_counted_as_independent_frames():
+    stacked = PlateRead(-1, 1.0, "MH12DE1433", [0.7] * 10, 100, 1000, 0.7, "stack", derived=True)
+    single = PlateRead(1, 0.2, "MH12DE1433", [0.7] * 10, 100, 1000, 0.7)
+    fused = fuse_plate_reads([single, stacked])
+    assert fused.text == "?" * 10

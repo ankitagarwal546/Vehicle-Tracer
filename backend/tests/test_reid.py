@@ -28,8 +28,10 @@ def test_partial_plates_are_compatible():
 def test_same_vehicle_links_across_cameras():
     a = profile("a", "c1", unit(1, 0.1, 0), "MH12??1433")
     b = profile("b", "c2", unit(1, 0.12, 0), "??12DE14??")
-    groups, links = link_tracks([a, b])
+    groups, links, _ = link_tracks([a, b])
     assert groups == [["a", "b"]] and links[0]["plate"] == 1.0
+    assert links[0]["evidence_tier"] == "partial_plate"
+    assert links[0]["temporal_status"] == "unavailable"
 
 
 def test_plate_weight_redistributes_when_absent():
@@ -41,16 +43,44 @@ def test_plate_weight_redistributes_when_absent():
 def test_plate_conflict_blocks_link():
     a = profile("a", "c1", unit(1, 0, 0), "MH12DE1433")
     b = profile("b", "c2", unit(1, 0, 0), "KA05XY9988")
-    assert link_tracks([a, b])[0] == []
+    result = link_tracks([a, b])
+    assert result.groups == [] and result.blocked == 1
+
+
+def test_attributes_and_visual_without_time_never_create_a_link():
+    assert link_tracks([profile("a", "c1", unit(1, 0, 0)), profile("b", "c2", unit(1, 0, 0))]).groups == []
+
+
+def test_strong_visual_with_plausible_time_is_proposed():
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    a = profile("a", "c1", unit(1, 0, 0), start=start)
+    b = profile("b", "c2", unit(1, 0, 0), start=start + timedelta(minutes=5))
+    result = link_tracks([a, b])
+    assert result.groups == [["a", "b"]] and result.links[0]["evidence_tier"] == "visual_time"
+
+
+def test_implausible_time_blocks_visual_link():
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    a = profile("a", "c1", unit(1, 0, 0), start=start)
+    b = profile("b", "c2", unit(1, 0, 0), start=start + timedelta(seconds=2))
+    assert link_tracks([a, b]).groups == []
+
+
+def test_repetitive_partial_digits_do_not_link():
+    a = profile("a", "c1", unit(1, 0, 0), "???????14444?")
+    b = profile("b", "c2", unit(0, 1, 0), "?144?4")
+    assert link_tracks([a, b]).groups == []
 
 
 def test_tracks_in_same_clip_never_link():
-    assert link_tracks([profile("a", "c1", unit(1, 0, 0)), profile("b", "c1", unit(1, 0, 0))])[0] == []
+    assert link_tracks([profile("a", "c1", unit(1, 0, 0), "MH12DE1433"),
+                         profile("b", "c1", unit(1, 0, 0), "MH12DE1433")]).groups == []
 
 
 def test_group_never_has_two_tracks_from_one_clip():
-    tracks = [profile("a", "c1", unit(1, 0, 0)), profile("b", "c2", unit(1, 0, 0)), profile("c", "c1", unit(1, 0, 0))]
-    groups, _ = link_tracks(tracks)
+    tracks = [profile("a", "c1", unit(1, 0, 0), "MH12DE1433"), profile("b", "c2", unit(1, 0, 0), "MH12DE1433"),
+              profile("c", "c1", unit(1, 0, 0), "MH12DE1433")]
+    groups, _, _ = link_tracks(tracks)
     assert len(groups) == 1 and len(groups[0]) == 2
 
 

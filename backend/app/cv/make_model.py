@@ -7,7 +7,8 @@ from app.cv.clip_service import ClipService
 from app.engine.confusion_matrices import body_similarity, normalise_body
 from app.engine.taxonomy import VEHICLE_TAXONOMY
 
-MIN_TOP1_CONFIDENCE = 0.35
+MIN_TOP1_CONFIDENCE = 0.50
+MIN_TOP1_MARGIN = 0.20
 COMPATIBLE_BODY = 0.45
 
 
@@ -33,6 +34,7 @@ def recognise(embedding: np.ndarray | None, body_type: str, clip: ClipService | 
     order = np.argsort(probabilities)[::-1][:3]
     ranked = [{"make": entries[i][0], "model": entries[i][1], "confidence": round(float(probabilities[i]), 4)}
               for i in order]
-    if ranked[0]["confidence"] < MIN_TOP1_CONFIDENCE:
+    runner_up = ranked[1]["confidence"] if len(ranked) > 1 else 0.0
+    if ranked[0]["confidence"] < MIN_TOP1_CONFIDENCE or ranked[0]["confidence"] - runner_up < MIN_TOP1_MARGIN:
         return {"status": "unknown", "predictions": [unknown], "below_threshold": ranked}
     return {"status": "recognised", "predictions": ranked, "below_threshold": []}

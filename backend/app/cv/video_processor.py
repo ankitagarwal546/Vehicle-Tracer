@@ -150,6 +150,9 @@ def sample_frames(
     """Yield the sharpest usable frame from each sampling window."""
     stats = stats if stats is not None else SamplingStats()
     target = min(max(sample_fps or settings.sample_fps, 0.5), metadata.fps)
+    if metadata.duration_sec > 0:
+        # Long clips are sampled more sparsely so the frame budget still covers the whole clip.
+        target = min(target, settings.max_frames_per_clip / metadata.duration_sec)
     window = max(int(round(metadata.fps / target)), 1)
     best: tuple[float, int, np.ndarray] | None = None
     previous: np.ndarray | None = None
@@ -181,8 +184,6 @@ def sample_frames(
         return SampledFrame(frame_idx, timestamp, image, sharp, brightness, contrast)
 
     for index, frame in _raw_frames(path, metadata):
-        if stats.kept >= settings.max_frames_per_clip:
-            return
         sharp = sharpness_score(cv2.resize(frame, (320, int(320 * frame.shape[0] / frame.shape[1]))))
         if best is None or sharp > best[0]:
             best = (sharp, index, frame)
