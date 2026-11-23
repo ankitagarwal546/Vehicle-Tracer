@@ -13,6 +13,7 @@ from app.config import PIPELINE_VERSION, settings
 from app.db.database import SessionLocal, init_db
 from app.db.models import Case
 from app.db.seed_registry import seed_registry
+from app.services.pipeline_orchestrator import refresh_legacy_results
 
 
 @asynccontextmanager
@@ -26,6 +27,7 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
             .values(status="FAILED", error="Interrupted by a server restart. Run the analysis again.")
         )
         session.commit()
+        refresh_legacy_results(session)
     yield
 
 

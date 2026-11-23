@@ -7,70 +7,99 @@
 <style>
   @page { size: A4; margin: 14mm; }
   * { box-sizing: border-box; }
-  body { margin: 0; background: #fff; color: #0F172A; font: 12px/1.45 -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; }
-  main { max-width: 1040px; margin: 0 auto; padding: 24px; }
-  h1 { font-size: 20px; margin: 0 0 2px; } h2 { font-size: 14px; margin: 24px 0 8px; padding-bottom: 4px; border-bottom: 1px solid #0F172A; }
-  h3 { font-size: 12px; margin: 14px 0 6px; }
-  .muted { color: #475569; } .mono, td.mono { font-family: "JetBrains Mono", Menlo, Consolas, monospace; font-variant-numeric: tabular-nums; }
+  body { margin: 0; background: #fff; color: #0F172A; font: 13px/1.5 -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; }
+  main { max-width: 980px; margin: 0 auto; padding: 24px 16px; }
+  h1 { font-size: 21px; margin: 0 0 2px; } h2 { font-size: 15px; margin: 26px 0 8px; padding-bottom: 4px; border-bottom: 1px solid #0F172A; }
+  h3 { font-size: 13px; margin: 14px 0 6px; }
+  .muted { color: #475569; } .mono { font-family: "JetBrains Mono", Menlo, Consolas, monospace; font-variant-numeric: tabular-nums; }
+  .scroll { overflow-x: auto; }
   table { width: 100%; border-collapse: collapse; margin: 6px 0; } th, td { border: 1px solid #E2E8F0; padding: 4px 6px; text-align: left; vertical-align: top; }
   th { background: #F8FAFC; font-weight: 600; color: #475569; }
   .hash { word-break: break-all; font-size: 10px; }
-  .verdict { padding: 8px 10px; border: 1px solid; font-weight: 700; margin: 8px 0; }
-  .ok { color: #065F46; border-color: #6EE7B7; background: #ECFDF5; } .no { color: #9F1239; border-color: #FDA4AF; background: #FFF1F2; }
-  .vehicle { page-break-before: always; } .vehicle:first-of-type { page-break-before: auto; }
-  .gallery { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; } figure { margin: 0; border: 1px solid #E2E8F0; padding: 4px; page-break-inside: avoid; }
-  figure img { width: 100%; display: block; } figcaption { font-size: 10px; color: #475569; }
-  .plates { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; }
-  .char { display: inline-block; width: 16px; text-align: center; border: 1px solid #E2E8F0; margin-right: 1px; font-family: Menlo, Consolas, monospace; }
+  .verdict { padding: 10px 12px; border: 1px solid; margin: 10px 0; }
+  .verdict strong { display: block; font-size: 15px; }
+  .ok { color: #065F46; border-color: #6EE7B7; background: #ECFDF5; } .warn { color: #92400E; border-color: #FCD34D; background: #FFFBEB; } .no { color: #9F1239; border-color: #FDA4AF; background: #FFF1F2; }
+  .stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 1px; background: #E2E8F0; border: 1px solid #E2E8F0; margin: 10px 0; }
+  .stats div { background: #fff; padding: 7px 9px; } .stats b { display: block; font: 600 18px Menlo, Consolas, monospace; } .stats span { font-size: 11px; color: #475569; }
+  .note { font-size: 12px; color: #475569; }
+  .evidence { border: 1px solid #E2E8F0; padding: 10px; margin: 10px 0; page-break-inside: avoid; }
+  .evidence-grid { display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 3fr); gap: 12px; }
+  .evidence img { width: 100%; display: block; border: 1px solid #E2E8F0; }
+  .plates { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; margin-top: 4px; font-size: 10px; color: #475569; }
+  .char { display: inline-block; width: 17px; text-align: center; border: 1px solid #CBD5E1; margin-right: -1px; font-family: Menlo, Consolas, monospace; font-weight: 600; }
   .exact { background: #D1FAE5; } .confusable { background: #FEF3C7; } .mismatch, .hard_mismatch { background: #FFE4E6; } .unknown, .unobserved { background: #F1F5F9; color: #64748B; }
   td.cell { text-align: center; padding: 2px; font-family: Menlo, Consolas, monospace; }
-  ul { margin: 4px 0; padding-left: 16px; }
-  footer { margin-top: 24px; padding-top: 6px; border-top: 1px solid #E2E8F0; color: #475569; font-size: 10px; }
+  ul { margin: 4px 0; padding-left: 18px; }
+  details { border: 1px solid #E2E8F0; margin: 8px 0; padding: 6px 10px; } summary { cursor: pointer; font-weight: 600; }
+  footer { margin-top: 24px; padding-top: 6px; border-top: 1px solid #E2E8F0; color: #475569; font-size: 11px; }
+  @media (max-width: 640px) { .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); } .evidence-grid { grid-template-columns: 1fr; } main { padding: 16px; } }
 </style>
 </head>
 <body><main>
 <h1>Vehicle Identification Forensic Report</h1>
 <div class="muted">Case <span class="mono">{{ case.id }}</span> · {{ case.title }} · Generated {{ generated_at }} UTC · Pipeline {{ case.pipeline_version or "n/a" }}</div>
-<div class="verdict {{ 'ok' if confident_count else 'no' }}">{{ "CONFIDENT SHORTLIST FOUND" if confident_count else "NO CONFIDENT MATCH" }} · {{ confident_count }} of {{ vehicles|length }} tracked vehicle(s) have a confident shortlist</div>
-<p class="muted">Results are investigative leads. A shortlist does not establish vehicle or owner identity and must be verified independently. Unreadable characters are shown as ? and are never inferred.</p>
+
+<h2>Executive Summary</h2>
+<div class="verdict {{ 'ok' if summary.plate_candidates else 'warn' if summary.ambiguous else 'no' }}">
+  <strong>{% if summary.plate_candidates %}{{ summary.plate_candidates }} plate-supported candidate{{ "s" if summary.plate_candidates != 1 }}{% elif summary.ambiguous %}No single match, {{ summary.ambiguous }} ambiguous{% else %}No confident match{% endif %}</strong>
+  {{ summary.tracks }} vehicle track(s) across {{ clips|length }} clip(s). {{ headline }}
+</div>
+<div class="stats">
+  <div><b>{{ summary.tracks }}</b><span>Vehicle tracks</span></div>
+  <div><b>{{ summary.plate_candidates }}</b><span>Plate-supported</span></div>
+  <div><b>{{ summary.ambiguous }}</b><span>Ambiguous</span></div>
+  <div><b>{{ summary.no_registry_match }}</b><span>No registry match</span></div>
+  <div><b>{{ summary.insufficient_plate }}</b><span>Partial plate only</span></div>
+  <div><b>{{ summary.unreadable_plate }}</b><span>Plate unreadable</span></div>
+  <div><b>{{ summary.possible_links }}</b><span>Links to review</span></div>
+  <div><b>{{ summary.confirmed_links }}</b><span>Confirmed links</span></div>
+</div>
+<p class="note">Results are investigative leads and do not establish vehicle or owner identity. Unreadable characters remain <span class="mono">?</span> and are never inferred. Match scores are uncalibrated ranking values, not probabilities. {{ registry_note }}{% if missing_time %} {{ missing_time }} clip(s) have no capture time, so temporal checks involving them were not validated.{% endif %}</p>
 
 <h2>Evidence Integrity</h2>
-<table><tr><th>Camera</th><th>File</th><th>SHA-256</th><th>Ingested (UTC)</th><th>Technical</th></tr>
-{% for clip in clips %}<tr><td>{{ clip.camera_label }}{% if clip.location %}<br><span class="muted">{{ clip.location }}</span>{% endif %}</td><td>{{ clip.filename }}</td><td class="mono hash">{{ clip.sha256 }}</td><td class="mono">{{ clip.ingested_at }}</td><td class="mono">{{ clip.width }}x{{ clip.height }} · {{ clip.fps }} fps · {{ clip.duration_sec }} s · {{ clip.codec }}</td></tr>{% endfor %}
-</table>
+<div class="scroll"><table><tr><th>Camera</th><th>File</th><th>SHA-256</th><th>Ingested (UTC)</th><th>Capture time</th><th>Technical</th></tr>
+{% for clip in clips %}<tr><td>{{ clip.camera_label }}{% if clip.location %}<br><span class="muted">{{ clip.location }}</span>{% endif %}{% if clip.plate_script == "non_latin" %}<br><span class="muted">Plate letters withheld (non-Latin script)</span>{% endif %}</td><td>{{ clip.filename }}</td><td class="mono hash">{{ clip.sha256 }}</td><td class="mono">{{ clip.ingested_at }}</td><td class="mono">{{ clip.recorded_at or "Not supplied" }}</td><td class="mono">{{ clip.width }}x{{ clip.height }} · {{ clip.fps }} fps · {{ clip.duration_sec }} s · {{ clip.codec }}</td></tr>{% endfor %}
+</table></div>
 
-{% if entities %}<h2>Cross-Camera Timeline</h2>
-{% for entity in entities %}<h3>Unified entity <span class="mono">{{ entity.id }}</span> · fused plate <span class="mono">{{ entity.fused_plate.text or "unread" }}</span> · {{ entity.match_result.status }}</h3>
-<table><tr><th>Camera</th><th>First seen</th><th>Last seen</th><th>Absolute time</th><th>Plate read</th></tr>
-{% for t in entity.timeline %}<tr><td>{{ t.camera_label }}</td><td class="mono">{{ t.first_seen_sec }} s</td><td class="mono">{{ t.last_seen_sec }} s</td><td class="mono">{{ t.absolute_time or "not supplied" }}</td><td class="mono">{{ t.plate or "unread" }}</td></tr>{% endfor %}</table>
-{% for l in entity.links %}<div class="muted mono">Link score {{ "%.3f"|format(l.score) }} · visual {{ "%.3f"|format(l.visual) }} · plate {{ l.plate if l.plate is not none else "n/a" }} · attributes {{ l.attributes if l.attributes is not none else "n/a" }} · {{ l.temporal_note }}</div>{% endfor %}
-{% endfor %}{% endif %}
-
-{% for v in vehicles %}<section class="vehicle">
-<h2>Vehicle <span class="mono">{{ v.id }}</span> · {{ v.camera_label }} · track {{ v.track_id }}</h2>
-<div class="verdict {{ 'ok' if v.match.status == 'CONFIDENT_SHORTLIST' else 'no' }}">{{ "CONFIDENT SHORTLIST FOUND" if v.match.status == "CONFIDENT_SHORTLIST" else "NO CONFIDENT MATCH" }} · plate evidence <span class="mono">{{ v.match.query_plate or "unread" }}</span>{% if v.overrides %} · includes investigator-verified values; AI read <span class="mono">{{ v.fused_plate.text or "unread" }}</span>{% endif %}</div>
-<table><tr><th>Seen</th><th>Colour</th><th>Body type</th><th>Make / model</th></tr><tr>
-<td class="mono">{{ v.first_seen_sec }}–{{ v.last_seen_sec }} s ({{ v.frames_tracked }} frames)</td>
-<td>{% for c in v.attributes.colours %}{{ c.label }} {{ "%.0f"|format(c.confidence*100) }}%{% if not loop.last %}, {% endif %}{% endfor %}</td>
-<td>{{ v.attributes.body_type.label }} {{ "%.0f"|format(v.attributes.body_type.confidence*100) }}%</td>
-<td>{% for m in v.attributes.make_model.predictions %}{{ m.make }} {{ m.model }}{% if m.confidence %} {{ "%.0f"|format(m.confidence*100) }}%{% endif %}{% if not loop.last %}, {% endif %}{% endfor %}</td>
-</tr></table>
-<h3>Keyframes</h3><div class="gallery">{% for k in v.keyframes %}<figure>{% if k.frame_uri %}<img src="{{ k.frame_uri }}" alt="Annotated frame">{% endif %}
-{% if k.raw_uri %}<div class="plates"><img src="{{ k.raw_uri }}" alt="Raw plate"><img src="{{ k.enhanced_uri }}" alt="Enhanced plate"></div>{% endif %}
-<figcaption class="mono">{{ k.timestamp_sec }} s · frame {{ k.frame_idx }} · sharp {{ k.sharpness }}{% if k.plate_text %} · {{ k.plate_text }}{% endif %}</figcaption></figure>{% endfor %}</div>
-{% if v.fused_plate.matrix %}<h3>Per-Frame Character Recovery Matrix</h3>
-<table><tr><th>Time</th>{% for s in v.fused_plate.slots %}<th>{{ loop.index }}</th>{% endfor %}</tr>
-{% for row in v.fused_plate.matrix %}<tr><td class="mono">{{ row.timestamp_sec }} s</td>{% for c in row.cells %}<td class="cell">{{ c.char }}</td>{% endfor %}</tr>{% endfor %}
-<tr><th>Fused</th>{% for s in v.fused_plate.slots %}<th class="mono">{{ s.char }}</th>{% endfor %}</tr></table>{% endif %}
-<h3>{{ "Top-5 Ranked Shortlist" if v.match.candidates else "Closest Rejected Candidates" }}</h3>
-<table><tr><th>#</th><th>Plate diff</th><th>Vehicle</th><th>Status</th><th>Conf.</th><th>Plate/Body/Colour/Model</th></tr>
-{% for c in (v.match.candidates or v.match.rejected_candidates) %}<tr><td class="mono">{{ c.rank }}</td><td>{% for d in c.slot_diff %}<span class="char {{ d.kind }}">{{ d.registry }}</span>{% endfor %}</td><td>{{ c.vehicle.colour }} {{ c.vehicle.make }} {{ c.vehicle.model }} ({{ c.vehicle.body_type }})</td><td>{{ c.vehicle.status }}</td><td class="mono">{{ "%.1f"|format(c.confidence) }}%</td><td class="mono">{{ c.sub_scores.plate }} / {{ c.sub_scores.body_type if c.sub_scores.body_type is not none else "n/a" }} / {{ c.sub_scores.colour if c.sub_scores.colour is not none else "n/a" }} / {{ c.sub_scores.make_model if c.sub_scores.make_model is not none else "n/a" }}</td></tr>{% endfor %}</table>
-<ul>{% for d in v.match.diagnostics %}<li>{{ d }}</li>{% endfor %}</ul>
-{% set lead = (v.match.candidates or v.match.rejected_candidates) %}{% if lead %}<h3>Reasoning for rank 1</h3><ul>{% for r in lead[0].reasons %}<li>{{ r }}</li>{% endfor %}</ul>{% endif %}
+<h2>Shortlist Results</h2>
+{% if key_vehicles %}{% for v in key_vehicles %}
+<section class="evidence">
+  <h3 style="margin-top:0">{{ v.camera_label }} · Track {{ v.track_id }} · <span class="mono">{{ v.match.query_plate or "plate not read" }}</span> · {{ v.outcome_label }}{% if v.overrides %} · includes investigator-verified values; AI read <span class="mono">{{ v.fused_plate.text or "unread" }}</span>{% endif %}</h3>
+  <div class="evidence-grid">
+    <div>{% set k = v.keyframes[0] if v.keyframes else none %}{% if k and k.crop_uri %}<img src="{{ k.crop_uri }}" alt="Vehicle crop">{% endif %}
+      {% if k and k.raw_uri %}<div class="plates"><div>Raw<img src="{{ k.raw_uri }}" alt="Raw plate"></div><div>Enhanced<img src="{{ k.enhanced_uri }}" alt="Enhanced plate"></div></div>{% endif %}
+    </div>
+    <div>
+      <div class="muted">{{ v.first_seen_sec }}–{{ v.last_seen_sec }} s · {{ v.attr_line }}</div>
+      <div class="scroll"><table><tr><th>#</th><th>Registry plate</th><th>Vehicle</th><th>Status</th><th>Score</th></tr>
+      {% for c in (v.match.candidates or v.match.rejected_candidates)[:3] %}<tr><td class="mono">{{ c.rank }}</td><td>{% for d in c.slot_diff %}<span class="char {{ d.kind }}">{{ d.registry }}</span>{% endfor %}</td><td>{{ c.vehicle.colour }} {{ c.vehicle.make }} {{ c.vehicle.model }} ({{ c.vehicle.body_type|pretty }})</td><td>{{ c.vehicle.status|pretty|lower }}</td><td class="mono">{{ "%.1f"|format(c.score) }}</td></tr>{% endfor %}</table></div>
+      <ul>{% for d in v.match.diagnostics %}<li>{{ d }}</li>{% endfor %}</ul>
+    </div>
+  </div>
 </section>{% endfor %}
+{% if hidden_key %}<p class="note">{{ hidden_key }} further track(s) with registry candidates are listed in the appendix.</p>{% endif %}
+{% else %}<p>No track had enough plate evidence to shortlist a registry vehicle. See the outcome counts above.</p>{% endif %}
 
-<h2>Investigator Audit Log</h2>
-<table><tr><th>Time (UTC)</th><th>Actor</th><th>Action</th><th>Vehicle</th><th>Field</th><th>AI extracted</th><th>Investigator verified</th><th>Note</th></tr>
-{% for e in audit %}<tr><td class="mono">{{ e.created_at }}</td><td>{{ e.actor }}</td><td>{{ e.action }}</td><td class="mono">{{ e.vehicle_id or "" }}</td><td>{{ e.field or "" }}</td><td class="mono">{{ e.ai_extracted or "" }}</td><td class="mono">{{ e.investigator_verified or "" }}</td><td>{{ e.note or "" }}</td></tr>{% else %}<tr><td colspan="8" class="muted">No audit events.</td></tr>{% endfor %}</table>
-<footer>Registry data in this deployment is synthetic unless replaced by the operator. Report integrity depends on the SHA-256 values above matching the original evidence files.</footer>
+<h2>Cross-Camera Links</h2>
+{% if entities %}<div class="scroll"><table><tr><th>Review status</th><th>Evidence</th><th>Sightings</th><th>Plate if merged</th><th>Temporal check</th></tr>
+{% for e in entities %}<tr><td>{{ e.status_label }}</td><td>{{ e.tier_label }}</td><td>{% for t in e.timeline %}{{ t.camera_label }} <span class="mono">{{ t.plate or "unread" }}</span>{% if not loop.last %}<br>{% endif %}{% endfor %}</td><td class="mono">{{ e.fused_plate.text or "unread" }}</td><td>{% for l in e.links %}{{ l.temporal_note }}{% if not loop.last %}<br>{% endif %}{% endfor %}</td></tr>{% endfor %}</table></div>
+<p class="note">A possible link is unverified until an investigator confirms it.</p>
+{% else %}<p>No pair of tracks had enough independent evidence to propose a link.</p>{% endif %}
+
+{% if overrides %}<h2>Investigator Changes</h2>
+<div class="scroll"><table><tr><th>Time (UTC)</th><th>Actor</th><th>Field</th><th>AI extracted</th><th>Investigator</th></tr>
+{% for e in overrides %}<tr><td class="mono">{{ e.created_at }}</td><td>{{ e.actor }}</td><td>{{ e.field or e.action }}</td><td class="mono">{{ e.ai_extracted or "" }}</td><td class="mono">{{ e.investigator_verified or "" }}</td></tr>{% endfor %}</table></div>{% endif %}
+
+{% if appendix %}
+<h2>Appendix</h2>
+<details><summary>All {{ vehicles|length }} tracks</summary><div class="scroll"><table><tr><th>Camera</th><th>Track</th><th>Seen</th><th>Fused plate</th><th>Outcome</th><th>Colour</th><th>Body</th></tr>
+{% for v in vehicles %}<tr><td>{{ v.camera_label }}</td><td class="mono">{{ v.track_id }}</td><td class="mono">{{ v.first_seen_sec }}–{{ v.last_seen_sec }} s</td><td class="mono">{{ v.match.query_plate or "not read" }}</td><td>{{ v.outcome_label }}</td><td>{{ v.attributes.colours[0].label if v.attributes.colours else "unknown" }}</td><td>{{ v.attributes.body_type.label|pretty }}</td></tr>{% endfor %}</table></div></details>
+<details><summary>Per-frame character recovery for {{ matrix_vehicles|length }} track(s) with plate reads</summary>
+{% for v in matrix_vehicles %}<h3>{{ v.camera_label }} · Track {{ v.track_id }}</h3><div class="scroll"><table><tr><th>Time</th>{% for s in v.fused_plate.slots %}<th>{{ loop.index }}</th>{% endfor %}</tr>
+{% for row in v.fused_plate.matrix %}<tr><td class="mono">{{ "stack" if row.derived else row.timestamp_sec ~ " s" }}</td>{% for c in row.cells %}<td class="cell">{{ c.char }}</td>{% endfor %}</tr>{% endfor %}
+<tr><th>Fused</th>{% for s in v.fused_plate.slots %}<th class="mono">{{ s.char }}</th>{% endfor %}</tr></table></div>{% endfor %}</details>
+<details><summary>Full audit log ({{ audit|length }} events)</summary><div class="scroll"><table><tr><th>Time (UTC)</th><th>Actor</th><th>Action</th><th>Field</th><th>AI extracted</th><th>Investigator</th><th>Note</th></tr>
+{% for e in audit %}<tr><td class="mono">{{ e.created_at }}</td><td>{{ e.actor }}</td><td>{{ e.action|pretty|lower }}</td><td>{{ e.field or "" }}</td><td class="mono hash">{{ e.ai_extracted or "" }}</td><td class="mono">{{ e.investigator_verified or "" }}</td><td>{{ e.note or "" }}</td></tr>{% endfor %}</table></div></details>
+{% endif %}
+<footer>Report integrity depends on the SHA-256 values above matching the original evidence files.</footer>
 </main></body></html>

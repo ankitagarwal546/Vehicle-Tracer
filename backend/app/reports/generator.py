@@ -1,4 +1,4 @@
-"""Self-contained HTML and print-ready PDF forensic reports."""
+"""Scannable HTML and PDF forensic reports with an optional detailed appendix."""
 from __future__ import annotations
 
 import base64
@@ -12,15 +12,19 @@ import cv2
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 from sqlalchemy.orm import Session
 
+from app.api.labels import ENTITY_STATUS_LABELS, EVIDENCE_TIER_LABELS, OUTCOME_LABELS, pretty
 from app.config import settings
-from app.db.models import Case
+from app.db.models import Case, RegistryVehicle
 
 logger = logging.getLogger(__name__)
 _environment = Environment(
     loader=FileSystemLoader(Path(__file__).parent / "templates"),
     autoescape=select_autoescape(["html"]),
 )
-MAX_FRAME_WIDTH = 520
+_environment.filters["pretty"] = pretty
+MAX_CROP_WIDTH = 420
+MAX_KEY_VEHICLES = 8
+OUTCOME_ORDER = {"PLATE_CANDIDATE": 0, "AMBIGUOUS": 1}
 
 
 def _data_uri(relative: str | None, max_width: int | None = None) -> str | None:
@@ -47,48 +51,102 @@ def _iso(value: datetime | None) -> str:
     return value.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
-def build_context(case: Case) -> dict:
+def _attribute_line(attributes: dict) -> str:
+    colours = attributes.get("colours") or []
+    colour = colours[0]["label"] if colours else "colour unknown"
+    body = pretty((attributes.get("body_type") or {}).get("label", "body unknown"))
+    predictions = (attributes.get("make_model") or {}).get("predictions") or []
+    model = "model unknown"
+    if predictions and predictions[0]["make"] != "Unknown":
+        model = f"estimated {predictions[0]['make']} {predictions[0]['model']}"
+    return f"{colour}, {body}, {model}"
+
+
+def build_context(session: Session, case: Case, appendix: bool) -> dict:
     clips = [{
         "camera_label": c.camera_label, "location": c.location, "filename": c.filename, "sha256": c.sha256,
-        "ingested_at": _iso(c.ingested_at), "width": c.width, "height": c.height, "fps": c.fps,
-        "duration_sec": c.duration_sec, "codec": c.codec,
+        "ingested_at": _iso(c.ingested_at), "recorded_at": _iso(c.recorded_at), "width": c.width, "height": c.height,
+        "fps": c.fps, "duration_sec": c.duration_sec, "codec": c.codec, "plate_script": c.plate_script,
     } for c in case.clips]
+
     vehicles = []
-    for vehicle in sorted(case.vehicles, key=lambda v: (v.clip.camera_label, v.first_seen_sec)):
-        keyframes = []
-        for frame in vehicle.keyframes[:3]:
-            keyframes.append({**frame, "frame_uri": _data_uri(frame.get("frame"), MAX_FRAME_WIDTH),
-                              "raw_uri": _data_uri(frame.get("plate_raw")),
-                              "enhanced_uri": _data_uri(frame.get("plate_enhanced"))})
+    for vehicle in sorted(case.vehicles, key=lambda v: (v.clip.camera_label, v.first_seen_sec, v.track_id)):
+        result = vehicle.match_result or {}
         vehicles.append({
             "id": vehicle.id, "camera_label": vehicle.clip.camera_label, "track_id": vehicle.track_id,
             "first_seen_sec": vehicle.first_seen_sec, "last_seen_sec": vehicle.last_seen_sec,
             "frames_tracked": vehicle.frames_tracked, "attributes": vehicle.attributes,
-            "fused_plate": vehicle.fused_plate, "keyframes": keyframes, "match": vehicle.match_result,
-            "overrides": vehicle.overrides,
+            "fused_plate": vehicle.fused_plate, "keyframes": vehicle.keyframes[:1], "match": result,
+            "overrides": vehicle.overrides, "outcome": result.get("outcome", "UNREADABLE_PLATE"),
+            "outcome_label": OUTCOME_LABELS.get(result.get("outcome", ""), "Not analysed"),
+            "attr_line": _attribute_line(vehicle.attributes or {}),
         })
-    entities = [{"id": e.id, "fused_plate": e.fused_plate, "timeline": e.timeline, "links": e.links,
-                 "match_result": e.match_result} for e in case.entities]
+    ranked = sorted((v for v in vehicles if v["outcome"] in OUTCOME_ORDER),
+                    key=lambda v: (OUTCOME_ORDER[v["outcome"]],
+                                   -((v["match"].get("candidates") or v["match"].get("rejected_candidates")
+                                      or [{"score": 0}])[0]["score"])))
+    key_vehicles = ranked[:MAX_KEY_VEHICLES]
+    for vehicle in key_vehicles:
+        vehicle["keyframes"] = [
+            {**frame, "crop_uri": _data_uri(frame.get("crop"), MAX_CROP_WIDTH),
+             "raw_uri": _data_uri(frame.get("plate_raw")), "enhanced_uri": _data_uri(frame.get("plate_enhanced"))}
+            for frame in vehicle["keyframes"]
+        ]
+
+    entities = [{
+        "id": e.id, "fused_plate": e.fused_plate, "timeline": e.timeline, "links": e.links,
+        "match_result": e.match_result, "review_status": e.review_status,
+        "status_label": ENTITY_STATUS_LABELS.get(e.review_status, e.review_status),
+        "tier_label": EVIDENCE_TIER_LABELS.get(e.evidence_tier, e.evidence_tier),
+    } for e in sorted(case.entities, key=lambda item: {"confirmed": 0, "proposed": 1}.get(item.review_status, 2))
+        if e.review_status != "rejected"]
     audit = [{"created_at": _iso(e.created_at), "actor": e.actor, "action": e.action, "vehicle_id": e.vehicle_id,
               "field": e.field, "ai_extracted": e.ai_extracted, "investigator_verified": e.investigator_verified,
               "note": e.note} for e in case.audit_events]
+    outcomes = [v["outcome"] for v in vehicles]
+    reviews = [e.review_status for e in case.entities]
+    summary = {
+        "tracks": len(vehicles),
+        "plate_candidates": outcomes.count("PLATE_CANDIDATE"), "ambiguous": outcomes.count("AMBIGUOUS"),
+        "no_registry_match": outcomes.count("NO_REGISTRY_MATCH"),
+        "insufficient_plate": outcomes.count("INSUFFICIENT_PLATE"),
+        "unreadable_plate": outcomes.count("UNREADABLE_PLATE"),
+        "possible_links": reviews.count("proposed"), "confirmed_links": reviews.count("confirmed"),
+    }
+    readable = summary["plate_candidates"] + summary["ambiguous"] + summary["no_registry_match"]
+    unusable = summary["insufficient_plate"] + summary["unreadable_plate"]
+    headline = (f"{readable} had enough plate characters to compare with the registry, and "
+                f"{summary['no_registry_match']} of those matched no registry vehicle. "
+                f"{unusable} had too few readable characters to compare.")
+    synthetic = session.query(RegistryVehicle).filter(RegistryVehicle.source == "synthetic").count()
+    total = session.query(RegistryVehicle).count()
+    if synthetic == total:
+        registry_note = f"The {total:,}-vehicle registry is entirely synthetic test data."
+    elif synthetic:
+        registry_note = f"{synthetic:,} of {total:,} registry vehicles are synthetic test data."
+    else:
+        registry_note = f"The registry contains {total:,} operator-supplied vehicles."
     return {
-        "case": case, "clips": clips, "vehicles": vehicles, "entities": entities, "audit": audit,
-        "generated_at": _iso(datetime.now(timezone.utc)),
-        "confident_count": sum(v["match"].get("status") == "CONFIDENT_SHORTLIST" for v in vehicles),
+        "case": case, "clips": clips, "vehicles": vehicles, "key_vehicles": key_vehicles,
+        "hidden_key": max(len(ranked) - MAX_KEY_VEHICLES, 0), "entities": entities, "audit": audit,
+        "overrides": [e for e in audit if e["action"] in {"INVESTIGATOR_OVERRIDE", "OVERRIDE_RESET", "LINK_REVIEWED"}],
+        "summary": summary, "headline": headline, "registry_note": registry_note,
+        "missing_time": sum(c.recorded_at is None for c in case.clips),
+        "matrix_vehicles": [v for v in vehicles if v["fused_plate"].get("matrix")],
+        "generated_at": _iso(datetime.now(timezone.utc)), "appendix": appendix,
     }
 
 
-def render_html(session: Session, case_id: str) -> str:
+def render_html(session: Session, case_id: str, appendix: bool = True) -> str:
     case = session.get(Case, case_id)
     if case is None:
         raise KeyError(case_id)
-    return _environment.get_template("report.html").render(**build_context(case))
+    return _environment.get_template("report.html").render(**build_context(session, case, appendix))
 
 
-def render_pdf(session: Session, case_id: str) -> tuple[bytes, str]:
+def render_pdf(session: Session, case_id: str, appendix: bool = False) -> tuple[bytes, str]:
     """Return ``(pdf_bytes, engine)``. WeasyPrint needs native libraries, so ReportLab backs it up."""
-    html = render_html(session, case_id)
+    html = render_html(session, case_id, appendix).replace("<details>", '<details open="">')
     try:
         from weasyprint import HTML
 
@@ -96,7 +154,7 @@ def render_pdf(session: Session, case_id: str) -> tuple[bytes, str]:
     except Exception as error:  # OSError on missing Pango/Cairo, or a rendering failure.
         logger.warning("WeasyPrint unavailable, using ReportLab: %s", error)
     case = session.get(Case, case_id)
-    return _reportlab_pdf(build_context(case)), "reportlab"
+    return _reportlab_pdf(build_context(session, case, appendix)), "reportlab"
 
 
 def _reportlab_pdf(context: dict) -> bytes:
@@ -104,15 +162,18 @@ def _reportlab_pdf(context: dict) -> bytes:
     from reportlab.lib.pagesizes import A4
     from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
     from reportlab.lib.units import mm
-    from reportlab.platypus import Image, PageBreak, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+    from reportlab.platypus import Image, KeepTogether, PageBreak, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
     styles = getSampleStyleSheet()
-    body = ParagraphStyle("body", parent=styles["BodyText"], fontSize=8, leading=10)
-    mono = ParagraphStyle("mono", parent=body, fontName="Courier", fontSize=7, leading=9)
-    heading = ParagraphStyle("h", parent=styles["Heading2"], fontSize=11, spaceBefore=8, spaceAfter=4)
+    body = ParagraphStyle("body", parent=styles["BodyText"], fontSize=8.5, leading=11)
+    small = ParagraphStyle("small", parent=body, fontSize=7.5, leading=9.5, textColor=colors.HexColor("#475569"))
+    mono = ParagraphStyle("mono", parent=body, fontName="Courier", fontSize=7.5, leading=9.5)
+    heading = ParagraphStyle("h", parent=styles["Heading2"], fontSize=12, spaceBefore=10, spaceAfter=4)
+    sub = ParagraphStyle("sub", parent=styles["Heading3"], fontSize=9.5, spaceBefore=4, spaceAfter=3)
     grid = TableStyle([("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#CBD5E1")),
                        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#F8FAFC")),
                        ("VALIGN", (0, 0), (-1, -1), "TOP")])
+    full_width = 182 * mm
 
     def p(value, style=body):
         return Paragraph(escape(str(value if value is not None else "")), style)
@@ -120,66 +181,119 @@ def _reportlab_pdf(context: dict) -> bytes:
     def image(uri: str | None, width: float):
         if not uri:
             return p("")
-        reader = io.BytesIO(base64.b64decode(uri.split(",", 1)[1]))
-        decoded = Image(reader)
+        decoded = Image(io.BytesIO(base64.b64decode(uri.split(",", 1)[1])))
         decoded.drawHeight = width * decoded.imageHeight / decoded.imageWidth
         decoded.drawWidth = width
         return decoded
 
-    case = context["case"]
-    story = [Paragraph("Vehicle Identification Forensic Report", styles["Title"]),
-             p(f"Case {case.id} - {case.title} - Generated {context['generated_at']} UTC"),
-             p("CONFIDENT SHORTLIST FOUND" if context["confident_count"] else "NO CONFIDENT MATCH"),
-             p("Results are investigative leads and must be verified independently."),
-             Paragraph("Evidence Integrity", heading)]
-    rows = [[p("Camera"), p("File"), p("SHA-256"), p("Technical")]]
-    rows += [[p(c["camera_label"]), p(c["filename"]), p(c["sha256"], mono),
-              p(f"{c['width']}x{c['height']} {c['fps']} fps {c['duration_sec']} s {c['codec']}")]
-             for c in context["clips"]]
-    story.append(Table(rows, colWidths=[28 * mm, 35 * mm, 75 * mm, 40 * mm], style=grid))
+    def table(rows, widths=None):
+        return Table(rows, colWidths=widths, style=grid, repeatRows=1)
 
-    for entity in context["entities"]:
-        story.append(Paragraph(f"Cross-camera entity {escape(entity['id'])}", heading))
-        rows = [[p("Camera"), p("First"), p("Last"), p("Plate")]]
-        rows += [[p(t["camera_label"]), p(t["first_seen_sec"]), p(t["last_seen_sec"]), p(t["plate"], mono)]
-                 for t in entity["timeline"]]
-        story.append(Table(rows, style=grid))
-        story.append(p(f"Fused plate {entity['fused_plate'].get('text') or 'unread'}", mono))
+    case, summary = context["case"], context["summary"]
+    tone = "#065F46" if summary["plate_candidates"] else "#92400E" if summary["ambiguous"] else "#9F1239"
+    verdict = f"{summary['plate_candidates']} plate-supported candidate(s)" if summary["plate_candidates"] else \
+        f"No single match, {summary['ambiguous']} ambiguous" if summary["ambiguous"] else "No confident match"
+    verdict_style = ParagraphStyle("verdict", parent=body, fontSize=12, leading=15, textColor=colors.HexColor(tone),
+                                   fontName="Helvetica-Bold")
+    story = [
+        Paragraph("Vehicle Identification Forensic Report", styles["Title"]),
+        p(f"Case {case.id} - {case.title} - Generated {context['generated_at']} UTC - "
+          f"Pipeline {case.pipeline_version or 'n/a'}", small),
+        Paragraph("Executive Summary", heading), Paragraph(escape(verdict), verdict_style),
+        p(f"{summary['tracks']} vehicle track(s) across {len(context['clips'])} clip(s). {context['headline']}"),
+    ]
+    labels = [("Vehicle tracks", "tracks"), ("Candidates", "plate_candidates"), ("Ambiguous", "ambiguous"),
+              ("No match", "no_registry_match"), ("Partial plate", "insufficient_plate"),
+              ("Unreadable", "unreadable_plate"), ("To review", "possible_links"),
+              ("Confirmed", "confirmed_links")]
+    story.append(table([[p(label, small) for label, _ in labels], [p(summary[key], mono) for _, key in labels]],
+                       [full_width / len(labels)] * len(labels)))
+    missing = f" {context['missing_time']} clip(s) have no capture time, so temporal checks were not validated." \
+        if context["missing_time"] else ""
+    story += [Spacer(1, 4), p("Results are investigative leads and do not establish identity. Unreadable characters "
+                              "remain ? and are never inferred. Match scores are uncalibrated ranking values, not "
+                              f"probabilities. {context['registry_note']}{missing}", small),
+              Paragraph("Evidence Integrity", heading)]
+    rows = [[p("Camera"), p("File"), p("SHA-256"), p("Capture (UTC)"), p("Technical")]]
+    for clip in context["clips"]:
+        camera = clip["camera_label"] + (" (letters withheld)" if clip["plate_script"] == "non_latin" else "")
+        rows.append([p(camera), p(clip["filename"]), p(clip["sha256"], mono), p(clip["recorded_at"] or "Not supplied"),
+                     p(f"{clip['width']}x{clip['height']} {clip['fps']} fps {clip['duration_sec']} s {clip['codec']}")])
+    story.append(table(rows, [25 * mm, 38 * mm, 62 * mm, 25 * mm, 32 * mm]))
 
-    for vehicle in context["vehicles"]:
+    story.append(Paragraph("Shortlist Results", heading))
+    if not context["key_vehicles"]:
+        story.append(p("No track had enough plate evidence to shortlist a registry vehicle."))
+    for vehicle in context["key_vehicles"]:
         match = vehicle["match"]
-        story += [PageBreak(), Paragraph(f"Vehicle {escape(vehicle['id'])} - {escape(vehicle['camera_label'])}", heading),
-                  p(f"{match['status']} - plate evidence {match['query_plate'] or 'unread'}", mono)]
+        frame = vehicle["keyframes"][0] if vehicle["keyframes"] else {}
+        pictures = [image(frame.get("crop_uri"), 40 * mm)]
+        if frame.get("raw_uri"):
+            pictures.append(image(frame["raw_uri"], 40 * mm))
+            pictures.append(image(frame.get("enhanced_uri"), 40 * mm))
+        rows = [[p("#"), p("Plate"), p("Vehicle"), p("Status"), p("Score")]]
+        for candidate in (match["candidates"] or match["rejected_candidates"])[:3]:
+            item = candidate["vehicle"]
+            rows.append([p(candidate["rank"]), p(item["plate"], mono),
+                         p(f"{item['colour']} {item['make']} {item['model']} ({pretty(item['body_type'])})"),
+                         p(pretty(item["status"]).lower()), p(f"{candidate['score']:.1f}")])
+        block = [Paragraph(escape(f"{vehicle['camera_label']} - Track {vehicle['track_id']} - "
+                                  f"{match['query_plate'] or 'plate not read'} - {vehicle['outcome_label']}"), sub),
+                 Table([pictures], hAlign="LEFT"), p(vehicle["attr_line"], small),
+                 table(rows, [8 * mm, 34 * mm, 90 * mm, 32 * mm, 18 * mm])]
         if vehicle["overrides"]:
-            story.append(p(f"Includes investigator-verified values. AI read: {vehicle['fused_plate'].get('text') or 'unread'}"))
-        pictures = [image(k.get("frame_uri"), 58 * mm) for k in vehicle["keyframes"]]
-        if pictures:
-            story.append(Table([pictures]))
-        plates = [cell for k in vehicle["keyframes"] if k.get("raw_uri")
-                  for cell in (image(k["raw_uri"], 28 * mm), image(k["enhanced_uri"], 28 * mm))]
-        if plates:
-            story.append(Table([plates[:6]]))
-        matrix = vehicle["fused_plate"].get("matrix", [])
-        if matrix:
-            rows = [[p("Time")] + [p(i + 1) for i in range(len(vehicle["fused_plate"]["slots"]))]]
-            rows += [[p(r["timestamp_sec"], mono)] + [p(c["char"], mono) for c in r["cells"]] for r in matrix]
-            rows += [[p("Fused")] + [p(s["char"], mono) for s in vehicle["fused_plate"]["slots"]]]
-            story.append(Table(rows, style=grid))
-        candidates = match["candidates"] or match["rejected_candidates"]
-        rows = [[p("#"), p("Plate"), p("Vehicle"), p("Status"), p("Conf.")]]
-        rows += [[p(c["rank"]), p(c["vehicle"]["plate"], mono),
-                  p(f"{c['vehicle']['colour']} {c['vehicle']['make']} {c['vehicle']['model']}"),
-                  p(c["vehicle"]["status"]), p(f"{c['confidence']:.1f}%")] for c in candidates]
-        story += [Spacer(1, 4), Table(rows, style=grid)]
-        story += [p(item) for item in match["diagnostics"]]
-        if candidates:
-            story += [p(item) for item in candidates[0]["reasons"]]
+            block.append(p(f"Includes investigator-verified values. AI read: "
+                           f"{vehicle['fused_plate'].get('text') or 'unread'}", small))
+        block += [p(item, small) for item in match["diagnostics"]]
+        story.append(KeepTogether(block))
+    if context["hidden_key"]:
+        story.append(p(f"{context['hidden_key']} further track(s) with registry candidates are listed in the appendix.",
+                       small))
 
-    story += [PageBreak(), Paragraph("Investigator Audit Log", heading)]
-    rows = [[p("Time"), p("Actor"), p("Action"), p("Field"), p("AI"), p("Verified")]]
-    rows += [[p(e["created_at"]), p(e["actor"]), p(e["action"]), p(e["field"]), p(e["ai_extracted"], mono),
-              p(e["investigator_verified"], mono)] for e in context["audit"]]
-    story.append(Table(rows, style=grid))
+    story.append(Paragraph("Cross-Camera Links", heading))
+    if context["entities"]:
+        rows = [[p("Review status"), p("Evidence"), p("Sightings"), p("Plate if merged"), p("Temporal check")]]
+        for entity in context["entities"]:
+            sightings = "; ".join(f"{t['camera_label']} {t['plate'] or 'unread'}" for t in entity["timeline"])
+            rows.append([p(entity["status_label"]), p(entity["tier_label"]), p(sightings, mono),
+                         p(entity["fused_plate"].get("text") or "unread", mono),
+                         p("; ".join(link["temporal_note"] for link in entity["links"]), small)])
+        story.append(table(rows, [24 * mm, 34 * mm, 48 * mm, 26 * mm, 50 * mm]))
+    else:
+        story.append(p("No pair of tracks had enough independent evidence to propose a link."))
+
+    if context["overrides"]:
+        story.append(Paragraph("Investigator Changes", heading))
+        rows = [[p("Time"), p("Actor"), p("Field"), p("AI"), p("Investigator")]]
+        rows += [[p(e["created_at"], mono), p(e["actor"]), p(e["field"] or e["action"]), p(e["ai_extracted"], mono),
+                  p(e["investigator_verified"], mono)] for e in context["overrides"]]
+        story.append(table(rows))
+
+    if context["appendix"]:
+        story += [PageBreak(), Paragraph("Appendix: All Tracks", heading)]
+        rows = [[p("Camera"), p("Track"), p("Seen"), p("Fused plate"), p("Outcome"), p("Colour"), p("Body")]]
+        for vehicle in context["vehicles"]:
+            colours = vehicle["attributes"].get("colours") or []
+            rows.append([p(vehicle["camera_label"]), p(vehicle["track_id"], mono),
+                         p(f"{vehicle['first_seen_sec']}-{vehicle['last_seen_sec']} s", mono),
+                         p(vehicle["match"].get("query_plate") or "not read", mono), p(vehicle["outcome_label"]),
+                         p(colours[0]["label"] if colours else "unknown"),
+                         p(pretty(vehicle["attributes"]["body_type"]["label"]))])
+        story.append(table(rows, [24 * mm, 12 * mm, 28 * mm, 30 * mm, 42 * mm, 18 * mm, 28 * mm]))
+        story.append(Paragraph("Appendix: Per-Frame Character Recovery", heading))
+        for vehicle in context["matrix_vehicles"]:
+            slots = vehicle["fused_plate"]["slots"]
+            rows = [[p("Time")] + [p(i + 1) for i in range(len(slots))]]
+            rows += [[p("stack" if r.get("derived") else r["timestamp_sec"], mono)]
+                     + [p(c["char"], mono) for c in r["cells"]] for r in vehicle["fused_plate"]["matrix"]]
+            rows += [[p("Fused")] + [p(s["char"], mono) for s in slots]]
+            story.append(KeepTogether([p(f"{vehicle['camera_label']} - Track {vehicle['track_id']}", sub),
+                                       table(rows, [18 * mm] + [10 * mm] * len(slots))]))
+        story.append(Paragraph("Appendix: Audit Log", heading))
+        rows = [[p("Time"), p("Actor"), p("Action"), p("Field"), p("Note")]]
+        rows += [[p(e["created_at"], mono), p(e["actor"]), p(pretty(e["action"]).lower()), p(e["field"]), p(e["note"])]
+                 for e in context["audit"]]
+        story.append(table(rows, [32 * mm, 24 * mm, 42 * mm, 34 * mm, 50 * mm]))
 
     buffer = io.BytesIO()
     SimpleDocTemplate(buffer, pagesize=A4, leftMargin=14 * mm, rightMargin=14 * mm, topMargin=14 * mm,
