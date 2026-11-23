@@ -1,18 +1,23 @@
-"""Explainable probabilistic vehicle matcher.
+"""Explainable plate-first vehicle matcher.
 
 Every number in a result can be traced to a formula in this module:
 
     S_plate = clamp(sum(slot contributions) / sum(known slot confidences)) * gamma
     gamma   = known_chars / expected_plate_length
     score   = 100 * sum(weight_k * S_k) * veto
-    conf    = min(cap, score * (0.90 + 0.10 * min(1, margin / 10)))
 
-Signals with no evidence are removed and their weight is redistributed proportionally.
+``score`` is an uncalibrated ranking score. It is not a probability of identity.
+
+Colour, body type and make/model only support a plate-based match. A vehicle can reach
+``CONFIDENT_SHORTLIST`` only when plate evidence alone clears every gate in ``THRESHOLDS``.
 """
 from __future__ import annotations
 
 import time
 from collections.abc import Iterable
+from math import ceil
+
+import numpy as np
 
 from .confusion_matrices import (
     body_similarity,
@@ -22,6 +27,7 @@ from .confusion_matrices import (
     normalise_body,
 )
 from .schemas import (
+    AttributeSuggestions,
     Candidate,
     MatchResult,
     PlateEvidence,
@@ -46,17 +52,28 @@ WEIGHTS = {
     "partial_plate": {"plate": 0.48, "body_type": 0.22, "colour": 0.18, "make_model": 0.12},
     "severe_occlusion": {"plate": 0.20, "body_type": 0.35, "colour": 0.27, "make_model": 0.18},
 }
-SEVERE_CONFIDENCE_CAP = 65.0
-MIN_CONFIDENCE = 45.0
+SEVERE_SCORE_CAP = 65.0
 VETO_BODY_CONFIDENCE = 0.85
 VETO_BODY_SIMILARITY = 0.10
 VETO_MULTIPLIER = 0.25
 MIN_BODY_COMPATIBILITY = 0.30
-MIN_HIGH_CONF_CHARS_FOR_GATE = 5
-MAX_HARD_MISMATCHES = 3
-AMBIGUITY_BAND = 1.0
-AMBIGUITY_COUNT = 6
 TOP_K = 5
+SUGGESTION_LIMIT = 5
+MIN_SUGGESTION_SIMILARITY = 0.80
+
+# Explicit promotion gates. Each one is reported to the investigator when it fails.
+THRESHOLDS: dict[str, float] = {
+    "min_readable_chars": 5,
+    "min_supporting_chars": 5,
+    "min_exact_chars": 4,
+    "min_plate_agreement": 0.70,
+    "max_hard_contradictions": 1,
+    "max_contradiction_share": 0.15,
+    "min_match_score": 45.0,
+    "min_score_gap": 5.0,
+    "min_plate_gap": 0.02,
+}
+MIN_PARTIAL_LIST_CHARS = 3
 
 
 def regime_for(known_chars: int) -> str:
@@ -152,37 +169,100 @@ def score_plate(plate: PlateEvidence, registry_plate: str) -> tuple[float, float
     return quality * gamma, quality, gamma, offset, hard, diff
 
 
-def score_colour(query: QueryEvidence, record: RegistryRecord) -> float | None:
+def score_colour(query: QueryEvidence, colour: str) -> float | None:
     total = sum(c.confidence for c in query.colours)
     if total <= 0:
         return None
-    return sum(c.confidence * colour_similarity(c.label, record.colour) for c in query.colours) / total
+    return sum(c.confidence * colour_similarity(c.label, colour) for c in query.colours) / total
 
 
-def score_body(query: QueryEvidence, record: RegistryRecord) -> float | None:
+def score_body(query: QueryEvidence, body_type: str) -> float | None:
     if not query.body_type or query.body_confidence <= 0:
         return None
-    return body_similarity(query.body_type, record.body_type)
+    return body_similarity(query.body_type, body_type)
 
 
-def score_make_model(query: QueryEvidence, record: RegistryRecord) -> float | None:
+def score_make_model(query: QueryEvidence, make: str, model: str) -> float | None:
     known = [m for m in query.make_models if m.make.lower() != "unknown" and m.confidence > 0]
     if not known:
         return None
     total = sum(m.confidence for m in known)
     score = 0.0
     for item in known:
-        same_make = item.make.lower() == record.make.lower()
-        same_model = item.model.lower() == record.model.lower()
+        same_make = item.make.lower() == make.lower()
+        same_model = item.model.lower() == model.lower()
         score += item.confidence * (1.0 if same_make and same_model else 0.5 if same_make else 0.15)
     return score / total
 
 
-def _resolved_weights(regime: str, signals: dict[str, float | None]) -> dict[str, float]:
+def _resolved_weights(regime: str, active: dict[str, bool]) -> dict[str, float]:
     base = WEIGHTS[regime]
-    active = {key: value for key, value in base.items() if key == "plate" or signals[key] is not None}
-    total = sum(active.values())
-    return {key: round(active.get(key, 0.0) / total, 4) for key in base}
+    enabled = {key: value for key, value in base.items() if key == "plate" or active[key]}
+    total = sum(enabled.values())
+    return {key: round(enabled.get(key, 0.0) / total, 4) for key in base}
+
+
+class RegistryIndex:
+    """Column-oriented registry so a re-rank stays interactive on large registries."""
+
+    def __init__(self, records: Iterable[RegistryRecord]) -> None:
+        self.records = list(records)
+        groups: dict[int, list[int]] = {}
+        for index, record in enumerate(self.records):
+            groups.setdefault(len(record.plate), []).append(index)
+        self.groups = {
+            length: (
+                np.asarray(indices, dtype=np.int32),
+                np.frombuffer("".join(self.records[i].plate for i in indices).encode("ascii"), dtype=np.uint8)
+                .reshape(len(indices), length),
+            )
+            for length, indices in groups.items() if length > 0
+        }
+        self.colours, self.colour_codes = self._encode(r.colour for r in self.records)
+        self.bodies, self.body_codes = self._encode(r.body_type for r in self.records)
+        self.make_models, self.make_model_codes = self._encode((r.make, r.model) for r in self.records)
+
+    @staticmethod
+    def _encode(values: Iterable) -> tuple[list, np.ndarray]:
+        lookup: dict = {}
+        codes = [lookup.setdefault(value, len(lookup)) for value in values]
+        return list(lookup), np.asarray(codes, dtype=np.int32)
+
+
+def _plate_scores(index: RegistryIndex, plate: PlateEvidence) -> np.ndarray:
+    scores = np.zeros(len(index.records), dtype=np.float64)
+    known_slots = [(i, slot) for i, slot in enumerate(plate.slots) if slot.char != "?"]
+    if not known_slots:
+        return scores
+    total_conf = sum(slot.confidence for _, slot in known_slots) or 1.0
+    tables: list[np.ndarray] = []
+    for _, slot in known_slots:
+        table = np.full(128, SOFT_MISMATCH_PENALTY * slot.confidence, dtype=np.float64)
+        for code in (*range(48, 58), *range(65, 91)):
+            char = chr(code)
+            table[code] = _score_slot(slot, char, "9" if char.isdigit() else "A")[1]
+        tables.append(table)
+    for length, (indices, chars) in index.groups.items():
+        best = np.full(len(indices), -np.inf)
+        for offset in _offsets(plate, length):
+            total = np.zeros(len(indices), dtype=np.float64)
+            for (slot_index, slot), table in zip(known_slots, tables):
+                position = slot_index + offset
+                if 0 <= position < length:
+                    total += table[chars[:, position]]
+                else:
+                    total += SOFT_MISMATCH_PENALTY * slot.confidence
+            quality = total / total_conf - (SHIFT_PENALTY if offset and plate.anchor == "full" else 0.0)
+            best = np.maximum(best, quality)
+        scores[indices] = np.clip(best, 0.0, 1.0) * min(len(known_slots) / length, 1.0)
+    return scores
+
+
+def _column(values: list, codes: np.ndarray, scorer) -> np.ndarray | None:
+    computed = [scorer(value) for value in values]
+    if not computed or computed[0] is None:
+        return None
+    return np.asarray(computed, dtype=np.float64)[codes]
 
 
 def _reasons(candidate: Candidate, query: QueryEvidence) -> list[str]:
@@ -207,63 +287,60 @@ def _reasons(candidate: Candidate, query: QueryEvidence) -> list[str]:
     )
     vehicle = candidate.vehicle
     if sub.colour is not None and query.colours:
-        reasons.append(f"Observed colour {query.colours[0].label} vs registry {vehicle.colour}: {sub.colour:.2f}.")
+        reasons.append(f"Supporting: observed colour {query.colours[0].label} vs registry {vehicle.colour} "
+                       f"({sub.colour:.2f}).")
     if sub.body_type is not None:
-        reasons.append(f"Observed body {query.body_type} vs registry {vehicle.body_type}: {sub.body_type:.2f}.")
+        reasons.append(f"Supporting: observed body {str(query.body_type).replace('_', ' ')} vs registry "
+                       f"{vehicle.body_type.replace('_', ' ')} ({sub.body_type:.2f}).")
     if sub.make_model is not None and query.make_models:
         top = query.make_models[0]
-        reasons.append(
-            f"Observed {top.make} {top.model} vs registry {vehicle.make} {vehicle.model}: {sub.make_model:.2f}."
-        )
+        reasons.append(f"Supporting: estimated {top.make} {top.model} vs registry {vehicle.make} {vehicle.model} "
+                       f"({sub.make_model:.2f}).")
     reasons.extend(candidate.contradictions)
     return reasons
 
 
-class _AttributeCache:
-    """Attribute scores depend only on a few registry values, so compute each combination once."""
-
-    def __init__(self, query: QueryEvidence) -> None:
-        self.query = query
-        self.colour: dict[str, float | None] = {}
-        self.body: dict[str, float | None] = {}
-        self.make_model: dict[tuple[str, str], float | None] = {}
-
-    def scores(self, record: RegistryRecord) -> tuple[float | None, float | None, float | None]:
-        if record.colour not in self.colour:
-            self.colour[record.colour] = score_colour(self.query, record)
-        if record.body_type not in self.body:
-            self.body[record.body_type] = score_body(self.query, record)
-        key = (record.make, record.model)
-        if key not in self.make_model:
-            self.make_model[key] = score_make_model(self.query, record)
-        return self.colour[record.colour], self.body[record.body_type], self.make_model[key]
-
-
-def _combine(
-    query: QueryEvidence, regime: str, plate: float, colour: float | None, body: float | None, make_model: float | None
-) -> tuple[float, dict[str, float], bool]:
-    signals = {"plate": plate, "colour": colour, "body_type": body, "make_model": make_model}
-    weights = _resolved_weights(regime, signals)
-    raw = sum(weights[key] * (value or 0.0) for key, value in signals.items())
-    vetoed = body is not None and query.body_confidence > VETO_BODY_CONFIDENCE and body <= VETO_BODY_SIMILARITY
-    return raw * VETO_MULTIPLIER if vetoed else raw, weights, vetoed
+def _plate_blockers(candidate: Candidate, known: int) -> list[str]:
+    """Return every plate gate this candidate fails. Attributes cannot clear any of them."""
+    t = THRESHOLDS
+    blockers: list[str] = []
+    supporting = candidate.exact_chars + candidate.confusable_chars
+    if known < t["min_readable_chars"]:
+        blockers.append(f"Only {known} readable plate character(s); {t['min_readable_chars']:.0f} are required.")
+    if supporting < t["min_supporting_chars"]:
+        blockers.append(f"Only {supporting} character(s) agree with this plate; "
+                        f"{t['min_supporting_chars']:.0f} are required.")
+    if candidate.exact_chars < t["min_exact_chars"]:
+        blockers.append(f"Only {candidate.exact_chars} exact character match(es); "
+                        f"{t['min_exact_chars']:.0f} are required.")
+    if candidate.sub_scores.plate_quality < t["min_plate_agreement"]:
+        blockers.append(f"Plate agreement {candidate.sub_scores.plate_quality:.2f} is below "
+                        f"{t['min_plate_agreement']:.2f}.")
+    share = candidate.hard_mismatches / known if known else 0.0
+    if candidate.hard_mismatches > t["max_hard_contradictions"] or share > t["max_contradiction_share"]:
+        blockers.append(f"{candidate.hard_mismatches} high-confidence character contradiction(s) with this plate.")
+    if candidate.vetoed:
+        blockers.append("Observed body type fundamentally conflicts with this registry entry.")
+    return blockers
 
 
-def _score_record(query: QueryEvidence, record: RegistryRecord, regime: str, cache: _AttributeCache) -> Candidate:
+def _build_candidate(query: QueryEvidence, record: RegistryRecord, regime: str, weights: dict[str, float],
+                     colour: float | None, body: float | None, make_model: float | None) -> Candidate:
     plate_score, quality, gamma, offset, hard, diff = score_plate(query.plate, record.plate)
-    colour, body, make_model = cache.scores(record)
-    raw, weights, vetoed = _combine(query, regime, plate_score, colour, body, make_model)
-
+    signals = {"plate": plate_score, "colour": colour, "body_type": body, "make_model": make_model}
+    raw = sum(weights[key] * (value or 0.0) for key, value in signals.items())
     contradictions: list[str] = []
+    vetoed = body is not None and query.body_confidence > VETO_BODY_CONFIDENCE and body <= VETO_BODY_SIMILARITY
     if vetoed:
+        raw *= VETO_MULTIPLIER
         contradictions.append(
-            f"Hard veto: {query.body_type} observed at {query.body_confidence:.0%} conflicts with "
-            f"registry {record.body_type}; score multiplied by {VETO_MULTIPLIER}."
+            f"Hard veto: {str(query.body_type).replace('_', ' ')} observed at {query.body_confidence:.0%} conflicts "
+            f"with registry {record.body_type.replace('_', ' ')}; score multiplied by {VETO_MULTIPLIER}."
         )
+    cap = SEVERE_SCORE_CAP if regime == "severe_occlusion" else 100.0
     return Candidate(
         vehicle=record,
-        score=round(raw * 100, 2),
-        confidence=0.0,
+        score=round(min(raw * 100, cap), 2),
         sub_scores=SubScores(
             plate=round(plate_score, 4),
             colour=None if colour is None else round(colour, 4),
@@ -275,6 +352,8 @@ def _score_record(query: QueryEvidence, record: RegistryRecord, regime: str, cac
         weights=weights,
         slot_diff=diff,
         alignment_offset=offset,
+        exact_chars=sum(d.kind == "exact" for d in diff),
+        confusable_chars=sum(d.kind == "confusable" for d in diff),
         hard_mismatches=hard,
         vetoed=vetoed,
         contradictions=contradictions,
@@ -282,72 +361,149 @@ def _score_record(query: QueryEvidence, record: RegistryRecord, regime: str, cac
     )
 
 
-def match(query: QueryEvidence, registry: Iterable[RegistryRecord], top_k: int = TOP_K) -> MatchResult:
-    """Rank the registry against the evidence and apply the no-confident-match gate."""
+def _suggestions(index: RegistryIndex, query: QueryEvidence, colour: np.ndarray | None,
+                 body: np.ndarray | None) -> AttributeSuggestions:
+    """Unranked, alphabetical appearance matches. Owner details are withheld."""
+    if colour is None and body is None:
+        return AttributeSuggestions()
+    mask = np.ones(len(index.records), dtype=bool)
+    basis: list[str] = []
+    if colour is not None:
+        mask &= colour >= MIN_SUGGESTION_SIMILARITY
+        basis.append(f"colour similar to {query.colours[0].label}")
+    if body is not None:
+        mask &= body >= MIN_SUGGESTION_SIMILARITY
+        basis.append(f"body similar to {str(query.body_type).replace('_', ' ')}")
+    matching = sorted((index.records[i] for i in np.flatnonzero(mask)), key=lambda r: r.plate)
+    return AttributeSuggestions(similar_count=len(matching), basis=basis,
+                                vehicles=[r.without_owner() for r in matching[:SUGGESTION_LIMIT]])
+
+
+def match(
+    query: QueryEvidence,
+    registry: Iterable[RegistryRecord] | RegistryIndex,
+    top_k: int = TOP_K,
+) -> MatchResult:
+    """Rank the registry against plate evidence and promote only what clears every gate."""
     started = time.perf_counter()
-    records = list(registry)
+    index = registry if isinstance(registry, RegistryIndex) else RegistryIndex(registry)
+    records = index.records
     known = query.plate.known_count
     regime = regime_for(known)
     query = query.model_copy(update={"body_type": normalise_body(query.body_type) if query.body_type else None})
-    # Fast numeric pass over the registry. Full explanations are built only for the head.
-    cache = _AttributeCache(query)
-    fast: list[tuple[float, float, str, int, float | None]] = []
-    for index, record in enumerate(records):
-        quality, gamma, _ = _align_plate(query.plate, record.plate)
-        plate_score = quality * gamma
-        colour, body, make_model = cache.scores(record)
-        raw = _combine(query, regime, plate_score, colour, body, make_model)[0]
-        fast.append((-round(raw * 100, 2), -round(plate_score, 4), record.plate, index, body))
-    fast.sort(key=lambda row: row[:3])
 
-    cap = SEVERE_CONFIDENCE_CAP if regime == "severe_occlusion" else 100.0
-    head = [_score_record(query, records[row[3]], regime, cache) for row in fast[: top_k + 1]]
-    for index, candidate in enumerate(head):
-        best_other = head[1].score if index == 0 and len(head) > 1 else head[0].score
-        margin = max(candidate.score - best_other, 0.0)
-        candidate.confidence = round(min(cap, candidate.score * (0.90 + 0.10 * min(1.0, margin / 10.0))), 2)
-    shortlist = head[:top_k]
-    for rank, candidate in enumerate(shortlist, start=1):
+    colour = _column(index.colours, index.colour_codes, lambda value: score_colour(query, value))
+    body = _column(index.bodies, index.body_codes, lambda value: score_body(query, value))
+    make_model = _column(index.make_models, index.make_model_codes,
+                         lambda value: score_make_model(query, value[0], value[1]))
+    weights = _resolved_weights(regime, {"colour": colour is not None, "body_type": body is not None,
+                                         "make_model": make_model is not None})
+    plate_scores = _plate_scores(index, query.plate)
+    raw = weights["plate"] * plate_scores
+    for key, column in (("colour", colour), ("body_type", body), ("make_model", make_model)):
+        if column is not None:
+            raw = raw + weights[key] * column
+    if body is not None and query.body_confidence > VETO_BODY_CONFIDENCE:
+        raw = np.where(body <= VETO_BODY_SIMILARITY, raw * VETO_MULTIPLIER, raw)
+    cap = SEVERE_SCORE_CAP if regime == "severe_occlusion" else 100.0
+    scores = np.minimum(np.round(raw * 100, 2), cap)
+
+    # Plate evidence ranks first. Attributes only order vehicles whose plate evidence is tied.
+    head: list[Candidate] = []
+    if records:
+        take = min(top_k + 1, len(records))
+        rounded_plate = np.round(plate_scores, 4)
+        floor = np.partition(rounded_plate, -take)[-take]
+        pool = np.flatnonzero(rounded_plate >= floor)
+        ordered = sorted(pool.tolist(), key=lambda i: (-rounded_plate[i], -scores[i], records[i].plate))
+        for i in ordered[:take]:
+            head.append(_build_candidate(
+                query, records[i], regime, weights,
+                None if colour is None else float(colour[i]),
+                None if body is None else float(body[i]),
+                None if make_model is None else float(make_model[i]),
+            ))
+    for rank, candidate in enumerate(head, start=1):
         candidate.rank = rank
+        candidate.blocking_reasons = _plate_blockers(candidate, known)
+        candidate.plate_supported = not candidate.blocking_reasons
         candidate.reasons = _reasons(candidate, query)
 
+    shortlist = head[:top_k]
+    t = THRESHOLDS
     diagnostics: list[str] = []
-    high_conf_known = sum(s.known and s.confidence >= HARD_CONFIDENCE for s in query.plate.slots)
+    codes: list[str] = []
+    outcome = "NO_REGISTRY_MATCH"
     top = shortlist[0] if shortlist else None
+
     if top is None:
-        diagnostics.append("Registry is empty.")
+        codes.append("EMPTY_REGISTRY")
+        diagnostics.append("The registry is empty.")
+    elif known == 0:
+        outcome = "UNREADABLE_PLATE"
+        codes.append("NO_PLATE_EVIDENCE")
+        diagnostics.append("No plate character could be read, so no registry vehicle can be identified. "
+                           "Colour, body type and model alone never identify a vehicle.")
+    elif known < t["min_readable_chars"]:
+        outcome = "INSUFFICIENT_PLATE"
+        codes.append("TOO_FEW_CHARACTERS")
+        diagnostics.append(f"Only {known} plate character(s) are readable; at least "
+                           f"{t['min_readable_chars']:.0f} are required before a vehicle can be shortlisted.")
     else:
-        if top.confidence < MIN_CONFIDENCE:
-            diagnostics.append(f"Top candidate confidence {top.confidence:.1f}% is below {MIN_CONFIDENCE:.0f}%.")
-        if high_conf_known >= MIN_HIGH_CONF_CHARS_FOR_GATE and top.hard_mismatches >= MAX_HARD_MISMATCHES:
-            diagnostics.append(
-                f"{high_conf_known} high-confidence characters were read, yet the top candidate has "
-                f"{top.hard_mismatches} non-confusable contradictions."
-            )
-        if query.body_type and query.body_confidence > 0 and all(
-            (row[4] or 0.0) < MIN_BODY_COMPATIBILITY for row in fast
-        ):
-            diagnostics.append(f"No registry vehicle is body-compatible with {query.body_type}.")
-        if regime == "severe_occlusion":
-            tied = sum(top.score + row[0] <= AMBIGUITY_BAND for row in fast)
-            if tied >= AMBIGUITY_COUNT:
+        if query.body_type and query.body_confidence > 0 and body is not None \
+                and bool(np.all(body < MIN_BODY_COMPATIBILITY)):
+            codes.append("BODY_INCOMPATIBLE")
+            diagnostics.append(f"No registry vehicle is body-compatible with {query.body_type.replace('_', ' ')}.")
+        if top.blocking_reasons:
+            codes.append("PLATE_NOT_SUPPORTED")
+            diagnostics.append("Closest registry plate does not qualify: " + " ".join(top.blocking_reasons))
+        if top.score < t["min_match_score"]:
+            codes.append("LOW_MATCH_SCORE")
+            diagnostics.append(f"Top match score {top.score:.1f} is below the {t['min_match_score']:.0f} threshold.")
+        if not codes and len(head) > 1:
+            rival = head[1]
+            score_gap = top.score - rival.score
+            plate_gap = top.sub_scores.plate - rival.sub_scores.plate
+            if score_gap < t["min_score_gap"] or plate_gap < t["min_plate_gap"]:
+                outcome = "AMBIGUOUS"
+                codes.append("AMBIGUOUS_CANDIDATES")
                 diagnostics.append(
-                    f"Only {known} plate character(s) readable and {tied} vehicles score within "
-                    f"{AMBIGUITY_BAND:.0f} point of the leader, so the evidence cannot discriminate."
+                    f"{rival.vehicle.plate} is too close to {top.vehicle.plate} (score gap {score_gap:.1f}, "
+                    f"plate gap {plate_gap:.2f}; required {t['min_score_gap']:.0f} and {t['min_plate_gap']:.2f})."
                 )
 
-    elapsed = (time.perf_counter() - started) * 1000
     base = {
         "regime": regime,
         "query_plate": query.plate.text,
         "known_chars": known,
         "registry_size": len(records),
-        "elapsed_ms": round(elapsed, 2),
+        "reason_codes": codes,
+        "thresholds": dict(t),
     }
-    if diagnostics:
-        return MatchResult(status="NO_CONFIDENT_MATCH", candidates=[], rejected_candidates=shortlist,
-                           diagnostics=diagnostics, **base)
-    rejected = [c for c in shortlist if c.confidence < MIN_CONFIDENCE or c.vetoed]
-    accepted = [c for c in shortlist if c not in rejected]
-    return MatchResult(status="CONFIDENT_SHORTLIST", candidates=accepted, rejected_candidates=rejected,
-                       diagnostics=[f"Top candidate cleared all decision gates at {top.confidence:.1f}%."], **base)
+    if codes or top is None:
+        # Show only registry plates that genuinely share characters with the read.
+        required = max(MIN_PARTIAL_LIST_CHARS, ceil(known / 2))
+        keep = [] if known < MIN_PARTIAL_LIST_CHARS else [
+            c.model_copy(update={"vehicle": c.vehicle.without_owner(), "rank": rank})
+            for rank, c in enumerate((c for c in shortlist if c.exact_chars >= required), start=1)
+        ]
+        if outcome == "NO_REGISTRY_MATCH" and not keep and known >= t["min_readable_chars"]:
+            diagnostics = [f"No registry plate shares at least {required} characters with this read."]
+            codes = ["NO_SIMILAR_PLATE"]
+            base["reason_codes"] = codes
+        suggestions = _suggestions(index, query, colour, body) if known < t["min_readable_chars"] \
+            else AttributeSuggestions()
+        return MatchResult(status="NO_CONFIDENT_MATCH", outcome=outcome, candidates=[], rejected_candidates=keep,
+                           attribute_suggestions=suggestions, diagnostics=diagnostics,
+                           elapsed_ms=round((time.perf_counter() - started) * 1000, 2), **base)
+
+    accepted = [c for c in shortlist if c.plate_supported and c.score >= t["min_match_score"]]
+    rejected = [c.model_copy(update={"vehicle": c.vehicle.without_owner()})
+                for c in shortlist if c not in accepted]
+    diagnostics.append(
+        f"{top.vehicle.plate} cleared every plate gate: {top.exact_chars} exact and {top.confusable_chars} "
+        f"confusable character(s), {top.hard_mismatches} contradiction(s), match score {top.score:.1f}."
+    )
+    return MatchResult(status="CONFIDENT_SHORTLIST", outcome="PLATE_CANDIDATE", candidates=accepted,
+                       rejected_candidates=rejected, diagnostics=diagnostics,
+                       elapsed_ms=round((time.perf_counter() - started) * 1000, 2), **base)

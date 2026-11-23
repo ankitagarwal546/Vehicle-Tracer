@@ -6,7 +6,7 @@ from pathlib import Path
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 BACKEND_DIR = Path(__file__).resolve().parent.parent
-PIPELINE_VERSION = "1.0.0"
+PIPELINE_VERSION = "2.0.0"
 
 
 class Settings(BaseSettings):
@@ -19,28 +19,28 @@ class Settings(BaseSettings):
     cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
 
     device: str = "auto"  # auto | cpu | mps | cuda
-    sample_fps: float = 5.0
-    max_frames_per_clip: int = 240
+    sample_fps: float = 6.0
+    max_frames_per_clip: int = 720
     min_sharpness: float = 12.0
     min_brightness: float = 12.0
     max_brightness: float = 248.0
     min_contrast: float = 6.0
 
-    yolo_model: str = "yolov8n.pt"
-    yolo_conf: float = 0.2
-    yolo_imgsz: int = 640
-    min_track_frames: int = 2
+    yolo_model: str = "auto"  # auto: yolov8s on GPU/MPS, yolov8n on CPU
+    yolo_conf: float = 0.25
+    yolo_imgsz: int = 0  # 0: 960 on GPU/MPS, 640 on CPU
+    min_track_frames: int = 3
 
-    alpr_detector_model: str = "yolo-v9-t-384-license-plate-end2end"
-    alpr_ocr_model: str = "cct-xs-v2-global-model"
-    plate_detector_conf: float = 0.25
+    alpr_detector_model: str = "yolo-v9-s-608-license-plate-end2end"
+    alpr_ocr_model: str = "cct-s-v2-global-model"
+    plate_detector_conf: float = 0.3
 
     clip_model: str = "ViT-B-32"
     clip_pretrained: str = "laion2b_s34b_b79k"
 
     tau_char: float = 0.55
     single_frame_min_conf: float = 0.78
-    reid_link_threshold: float = 0.62
+    registry_size: int = 5000
     max_upload_mb: int = 1024
 
 

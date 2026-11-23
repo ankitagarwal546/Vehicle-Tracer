@@ -30,6 +30,7 @@ class RegistryVehicle(Base):
     owner_name: Mapped[str | None] = mapped_column(String(120), nullable=True)
     owner_city: Mapped[str | None] = mapped_column(String(80), nullable=True)
     status: Mapped[str] = mapped_column(String(24), default="ACTIVE", index=True)
+    source: Mapped[str] = mapped_column(String(16), default="synthetic", index=True)
 
 
 class Case(Base):
@@ -72,6 +73,7 @@ class Clip(Base):
     duration_sec: Mapped[float] = mapped_column(Float, default=0.0)
     frame_count: Mapped[int] = mapped_column(Integer, default=0)
     codec: Mapped[str] = mapped_column(String(32), default="")
+    plate_script: Mapped[str] = mapped_column(String(16), default="latin")
     processing: Mapped[dict] = mapped_column(JSON, default=dict)
 
     case: Mapped[Case] = relationship(back_populates="clips")
@@ -87,6 +89,11 @@ class CrossCameraEntity(Base):
     timeline: Mapped[list] = mapped_column(JSON, default=list)
     links: Mapped[list] = mapped_column(JSON, default=list)
     match_result: Mapped[dict] = mapped_column(JSON, default=dict)
+    review_status: Mapped[str] = mapped_column(String(16), default="proposed", index=True)
+    evidence_tier: Mapped[str] = mapped_column(String(32), default="unverified")
+    reviewed_by: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    review_note: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     case: Mapped[Case] = relationship(back_populates="entities")
     vehicles: Mapped[list["TrackedVehicle"]] = relationship(back_populates="entity")

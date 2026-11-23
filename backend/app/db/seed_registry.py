@@ -3,9 +3,10 @@ from __future__ import annotations
 
 import random
 
-from sqlalchemy import func, select
+from sqlalchemy import func, insert, select, update
 from sqlalchemy.orm import Session
 
+from app.config import settings
 from app.db.database import SessionLocal, init_db
 from app.db.models import RegistryVehicle
 from app.engine.taxonomy import VEHICLE_TAXONOMY
@@ -93,13 +94,26 @@ def build_registry(size: int = REGISTRY_SIZE, seed: int = SEED) -> list[dict]:
     return rows
 
 
-def seed_registry(session: Session, force: bool = False) -> int:
-    existing = session.scalar(select(func.count()).select_from(RegistryVehicle)) or 0
-    if existing and not force:
-        return existing
+def seed_registry(session: Session, force: bool = False, size: int | None = None) -> int:
+    """Create or top up the synthetic registry. Uploaded vehicles are never modified."""
+    target = settings.registry_size if size is None else size
     if force:
         session.query(RegistryVehicle).delete()
-    session.bulk_insert_mappings(RegistryVehicle, build_registry())
+        session.flush()
+    rows = build_registry(target)
+    generated = {row["plate"] for row in rows}
+    existing = set(session.scalars(select(RegistryVehicle.plate)).all())
+    uploaded = existing - generated
+    if uploaded:
+        session.execute(update(RegistryVehicle).where(RegistryVehicle.plate.in_(uploaded))
+                        .values(source="uploaded"))
+    synthetic = len(existing & generated)
+    if existing and synthetic == 0:
+        session.commit()  # The operator replaced the registry, so do not add synthetic rows back.
+        return len(existing)
+    missing = [{**row, "source": "synthetic"} for row in rows if row["plate"] not in existing]
+    if missing:
+        session.execute(insert(RegistryVehicle), missing)
     session.commit()
     return session.scalar(select(func.count()).select_from(RegistryVehicle)) or 0
 

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 
-from sqlalchemy import create_engine, event
+from sqlalchemy import create_engine, event, inspect, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
@@ -40,3 +40,26 @@ def init_db() -> None:
     from app.db import models  # noqa: F401
 
     Base.metadata.create_all(engine)
+    _add_missing_columns()
+
+
+def _add_missing_columns() -> None:
+    """Upgrade databases created by an earlier release without losing cases."""
+    additions = {
+        "registry_vehicles": {"source": "VARCHAR(16) NOT NULL DEFAULT 'synthetic'"},
+        "clips": {"plate_script": "VARCHAR(16) NOT NULL DEFAULT 'latin'"},
+        "cross_camera_entities": {
+            "review_status": "VARCHAR(16) NOT NULL DEFAULT 'proposed'",
+            "evidence_tier": "VARCHAR(32) NOT NULL DEFAULT 'legacy_unverified'",
+            "reviewed_by": "VARCHAR(120)",
+            "reviewed_at": "TIMESTAMP",
+            "review_note": "TEXT",
+        },
+    }
+    inspector = inspect(engine)
+    with engine.begin() as connection:
+        for table, columns in additions.items():
+            existing = {column["name"] for column in inspector.get_columns(table)}
+            for name, definition in columns.items():
+                if name not in existing:
+                    connection.execute(text(f'ALTER TABLE {table} ADD COLUMN {name} {definition}'))

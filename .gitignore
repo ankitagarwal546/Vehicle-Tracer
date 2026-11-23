@@ -40,3 +40,5 @@ frontend/dist/
 .env.*
 !.env.example
 .DS_Store
+backend/storage/backups/
+backend/storage/models/

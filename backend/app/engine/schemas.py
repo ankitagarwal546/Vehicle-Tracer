@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 
 UNKNOWN = "?"
 Anchor = Literal["full", "prefix", "suffix", "floating"]
+Outcome = Literal["PLATE_CANDIDATE", "AMBIGUOUS", "NO_REGISTRY_MATCH", "INSUFFICIENT_PLATE", "UNREADABLE_PLATE"]
 
 
 class CharCandidate(BaseModel):
@@ -78,6 +79,11 @@ class RegistryRecord(BaseModel):
     owner_name: str | None = None
     owner_city: str | None = None
     status: str = "ACTIVE"
+    source: str = "synthetic"
+
+    def without_owner(self) -> "RegistryRecord":
+        """Owner details are shown only for vehicles the plate evidence supports."""
+        return self.model_copy(update={"owner_name": None, "owner_city": None})
 
 
 class SlotDiff(BaseModel):
@@ -102,24 +108,40 @@ class Candidate(BaseModel):
     rank: int = 0
     vehicle: RegistryRecord
     score: float
-    confidence: float
     sub_scores: SubScores
     weights: dict[str, float]
     slot_diff: list[SlotDiff]
     alignment_offset: int
+    exact_chars: int = 0
+    confusable_chars: int = 0
     hard_mismatches: int
+    plate_supported: bool = False
+    blocking_reasons: list[str] = Field(default_factory=list)
     vetoed: bool
     contradictions: list[str]
     reasons: list[str]
 
 
+class AttributeSuggestions(BaseModel):
+    """Vehicles with similar appearance. These are unranked and are never identifications."""
+
+    similar_count: int = 0
+    vehicles: list[RegistryRecord] = Field(default_factory=list)
+    basis: list[str] = Field(default_factory=list)
+
+
 class MatchResult(BaseModel):
     status: Literal["CONFIDENT_SHORTLIST", "NO_CONFIDENT_MATCH"]
+    outcome: Outcome
+    reason_codes: list[str] = Field(default_factory=list)
     regime: Literal["high_readability", "partial_plate", "severe_occlusion"]
     query_plate: str
     known_chars: int
     candidates: list[Candidate]
     rejected_candidates: list[Candidate]
+    attribute_suggestions: AttributeSuggestions = Field(default_factory=AttributeSuggestions)
     diagnostics: list[str]
+    thresholds: dict[str, float] = Field(default_factory=dict)
+    score_is_calibrated: bool = False
     registry_size: int
     elapsed_ms: float

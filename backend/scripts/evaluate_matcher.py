@@ -1,6 +1,7 @@
 """100-case matcher benchmark: 80 degraded true matches and 20 out-of-registry vehicles.
 
-This measures the matcher on simulated OCR evidence. It does not measure OCR or CV accuracy.
+This tests matcher behaviour on simulated OCR evidence. It does not measure OCR or CV accuracy,
+and its promoted-precision figure is not a calibrated real-world probability.
 """
 from __future__ import annotations
 
@@ -14,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.db.seed_registry import SERIES_LETTERS, build_registry  # noqa: E402
 from app.engine.confusion_matrices import COLOURS, OCR_CONFUSABLE  # noqa: E402
-from app.engine.matcher import match  # noqa: E402
+from app.engine.matcher import RegistryIndex, match  # noqa: E402
 from app.engine.schemas import (  # noqa: E402
     CharCandidate,
     LabelScore,
@@ -90,50 +91,59 @@ def near_miss_plate(source: str, known: set[str], rng: random.Random) -> str:
             return plate
 
 
-def evaluate(seed: int) -> dict:
+def evaluate(seed: int, size: int = 5000) -> dict:
     rng = random.Random(seed)
-    rows = build_registry()
+    rows = build_registry(size)
     registry = [RegistryRecord(id=i, **row) for i, row in enumerate(rows, 1)]
     known = {row["plate"] for row in rows}
-    top1 = top5 = 0
+    index = RegistryIndex(registry)
+    top1 = top5 = accepted = accepted_correct = 0
     reciprocal = 0.0
     tp_no_match = fp_no_match = fn_no_match = 0
     elapsed: list[float] = []
 
     for source in rng.sample(rows, 80):
         query = attributes(source, rng, degrade_plate(source["plate"], rng))
-        result = match(query, registry)
+        result = match(query, index)
         elapsed.append(result.elapsed_ms)
         ranked = [c.vehicle.plate for c in (result.candidates + result.rejected_candidates)]
         if result.status == "NO_CONFIDENT_MATCH":
             fp_no_match += 1
+        else:
+            accepted += 1
+            accepted_correct += result.candidates[0].vehicle.plate == source["plate"]
         if ranked and ranked[0] == source["plate"]:
             top1 += 1
         if source["plate"] in ranked[:5]:
             top5 += 1
             reciprocal += 1 / (ranked.index(source["plate"]) + 1)
 
-    for index in range(20):
+    for position in range(20):
         source = rng.choice(rows)
-        plate = near_miss_plate(source["plate"], known, rng) if index % 2 else out_of_registry_plate(known, rng)
+        plate = near_miss_plate(source["plate"], known, rng) if position % 2 else out_of_registry_plate(known, rng)
         evidence = PlateEvidence(slots=[
             SlotEvidence() if rng.random() < 0.1 else SlotEvidence(char=c, confidence=rng.uniform(0.82, 0.98))
             for c in plate
         ], anchor="full")
-        result = match(attributes(source, rng, evidence), registry)
+        result = match(attributes(source, rng, evidence), index)
         elapsed.append(result.elapsed_ms)
         if result.status == "NO_CONFIDENT_MATCH":
             tp_no_match += 1
         else:
             fn_no_match += 1
+            accepted += 1
 
     precision = tp_no_match / max(tp_no_match + fp_no_match, 1)
     recall = tp_no_match / max(tp_no_match + fn_no_match, 1)
     return {
-        "seed": seed, "cases": 100, "true_match_cases": 80, "no_match_cases": 20,
-        "top1_accuracy": round(top1 / 80, 4), "top5_recall": round(top5 / 80, 4), "mrr": round(reciprocal / 80, 4),
-        "no_match_precision": round(precision, 4), "no_match_recall": round(recall, 4),
-        "true_matches_wrongly_rejected": fp_no_match,
+        "seed": seed, "registry_size": len(rows), "cases": 100, "true_match_cases": 80, "no_match_cases": 20,
+        "top1_rank_accuracy": round(top1 / 80, 4), "top5_recall": round(top5 / 80, 4),
+        "mrr": round(reciprocal / 80, 4),
+        "promoted_results": accepted, "promoted_correct": accepted_correct,
+        "promoted_precision": round(accepted_correct / max(accepted, 1), 4),
+        "true_matches_promoted": round((80 - fp_no_match) / 80, 4),
+        "no_match_recall": round(recall, 4), "no_match_precision": round(precision, 4),
+        "true_matches_withheld": fp_no_match,
         "mean_match_ms": round(sum(elapsed) / len(elapsed), 2), "max_match_ms": round(max(elapsed), 2),
     }
 
@@ -141,8 +151,9 @@ def evaluate(seed: int) -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument("--registry-size", type=int, default=5000)
     args = parser.parse_args()
-    print(json.dumps(evaluate(args.seed), indent=2))
+    print(json.dumps(evaluate(args.seed, args.registry_size), indent=2))
 
 
 if __name__ == "__main__":
