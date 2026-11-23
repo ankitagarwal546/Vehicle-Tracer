@@ -12,8 +12,13 @@ ENTITY_STATUS_LABELS = {"proposed": "Possible link", "confirmed": "Confirmed veh
 EVIDENCE_TIER_LABELS = {
     "strong_plate": "Consistent plate characters",
     "partial_plate": "Partial plate plus visual similarity",
-    "visual_time": "Strong visual similarity with plausible time",
     "legacy_unverified": "Older analysis, re-run required",
+}
+PLATE_FORMAT_LABELS = {
+    "latin_any": "Latin A-Z, 0-9",
+    "india_rto": "India RTO / BH",
+    "uk": "UK",
+    "non_latin_digits": "Non-Latin, digits only",
 }
 
 

@@ -6,10 +6,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from app.config import settings  # noqa: E402
 from app.services.pipeline_orchestrator import models  # noqa: E402
 
 
 def main() -> int:
+    settings.allow_model_download = True
     models.load()
     status = models.status()
     print(f"Device:    {status['device']}")

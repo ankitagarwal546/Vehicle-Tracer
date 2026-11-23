@@ -16,8 +16,9 @@ import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 from app.db.database import SessionLocal  # noqa: E402
-from app.db.models import Case, CrossCameraEntity, TrackedVehicle  # noqa: E402
-from app.engine.schemas import PlateEvidence, QueryEvidence  # noqa: E402
+from app.db.models import Case, Clip, CrossCameraEntity, TrackedVehicle  # noqa: E402
+from app.engine.matcher import match  # noqa: E402
+from app.engine.schemas import PlateEvidence, QueryEvidence, RegistryRecord  # noqa: E402
 from app.main import app  # noqa: E402
 
 
@@ -87,8 +88,6 @@ def test_override_reranks_with_audit_and_report(client):
         case = Case(title="Override")
         session.add(case)
         session.flush()
-        from app.db.models import Clip
-
         clip = Clip(case_id=case.id, filename="c.mp4", stored_path="c.mp4", sha256="a" * 64, size_bytes=1, camera_label="Cam")
         session.add(clip)
         session.flush()
@@ -150,3 +149,71 @@ def test_clip_script_can_be_updated(client, clip_path):
     updated = client.patch(f"/api/cases/{case['id']}/clips/{clip['id']}", json={"plate_script": "latin"}).json()
     assert updated["plate_script"] == "latin"
     assert client.patch(f"/api/cases/{case['id']}/clips/{clip['id']}", json={"plate_script": "x"}).status_code == 422
+
+
+def _case_with_outcomes():
+    with SessionLocal() as session:
+        case = Case(title="Report counts", status="COMPLETED")
+        session.add(case)
+        session.flush()
+        clip_a = Clip(case_id=case.id, filename="synthetic_a.mp4", stored_path="a.mp4", sha256="a" * 64, size_bytes=1,
+                      camera_label="A", plate_format="india_rto", timezone="Asia/Kolkata")
+        clip_b = Clip(case_id=case.id, filename="b.mp4", stored_path="b.mp4", sha256="b" * 64, size_bytes=1,
+                      camera_label="B", plate_format="uk")
+        session.add_all([clip_a, clip_b])
+        session.flush()
+        attributes = {"colours": [], "body_type": {"label": "suv", "confidence": 0.7},
+                      "make_model": {"predictions": [{"make": "Unknown", "model": "Unknown", "confidence": 0}]}}
+        registry = [RegistryRecord(plate="MH12DE1433", body_type="suv", colour="white")]
+        for clip, text, plate_format in ((clip_a, "MH12DE1433", "india_rto"), (clip_a, "", "india_rto"),
+                                         (clip_b, "QA15ZZK", "uk")):
+            evidence = QueryEvidence(plate=PlateEvidence.from_text(text), body_type="suv", body_confidence=0.7,
+                                     plate_format=plate_format)
+            session.add(TrackedVehicle(
+                case_id=case.id, clip_id=clip.id, track_id=len(text) + 1, first_seen_sec=0, last_seen_sec=1,
+                frames_tracked=3, ai_evidence=evidence.model_dump(), active_evidence=evidence.model_dump(),
+                attributes=attributes, fused_plate={"text": text, "slots": [], "matrix": []},
+                match_result=match(evidence, registry).model_dump(), keyframes=[], plate_reads=[],
+            ))
+        session.commit()
+        return case.id, clip_a.id
+
+
+def test_report_counts_match_case_summary_and_clip_scope(client):
+    case_id, clip_id = _case_with_outcomes()
+    summary = client.get(f"/api/cases/{case_id}").json()["summary"]
+    assert (summary["tracks"], summary["plate_candidates"], summary["unreadable_plate"],
+            summary["no_registry_match"]) == (3, 1, 1, 1)
+    report = client.get(f"/api/cases/{case_id}/report/html").text
+    for value, label in ((3, "Vehicle tracks"), (1, "Plate-supported"), (1, "No registry match"),
+                         (1, "Plate unreadable")):
+        assert f"<b>{value}</b><span>{label}</span>" in report
+    assert "Synthetic test fixture" in report
+    scoped = client.get(f"/api/cases/{case_id}/report/html", params={"clip_id": clip_id}).text
+    assert "<b>2</b><span>Vehicle tracks</span>" in scoped and "QA15ZZK" not in scoped
+    assert client.get(f"/api/cases/{case_id}/report/html", params={"clip_id": "missing"}).status_code == 404
+    assert client.get(f"/api/cases/{case_id}/report/pdf", params={"clip_id": clip_id}).content.startswith(b"%PDF")
+
+
+def test_analysis_reports_missing_models_without_downloading(client, clip_path):
+    case = client.post("/api/cases", json={"title": "No models"}).json()
+    with clip_path.open("rb") as handle:
+        client.post(f"/api/cases/{case['id']}/clips", files={"files": ("m.mp4", handle, "video/mp4")})
+    response = client.post(f"/api/cases/{case['id']}/analyze")
+    assert response.status_code == 503 and "download_models.py" in response.json()["detail"]
+    assets = client.get("/api/health").json()["models"]["assets"]
+    assert assets["ready"] is False and assets["missing"]
+
+
+def test_evidence_is_read_only_and_time_uses_camera_timezone(client, clip_path):
+    case = client.post("/api/cases", json={"title": "Custody"}).json()
+    with clip_path.open("rb") as handle:
+        clip = client.post(f"/api/cases/{case['id']}/clips", files={"files": ("t.mp4", handle, "video/mp4")},
+                           data={"recorded_at": "2026-01-01T10:00", "timezone": "Asia/Kolkata",
+                                 "plate_format": "uk"}).json()["clips"][0]
+    assert clip["recorded_at"].startswith("2026-01-01T04:30") and clip["plate_format"] == "uk"
+    with SessionLocal() as session:
+        stored = Path(session.get(Clip, clip["id"]).stored_path)
+    assert stored.stat().st_mode & 0o222 == 0
+    bad = client.patch(f"/api/cases/{case['id']}/clips/{clip['id']}", json={"timezone": "Mars/Base"})
+    assert bad.status_code == 422

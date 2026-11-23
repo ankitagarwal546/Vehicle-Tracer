@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import io
 import json
+import os
 import re
 import shutil
 import uuid
@@ -10,6 +11,7 @@ from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import HTMLResponse, Response, StreamingResponse
@@ -18,6 +20,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from app.config import PIPELINE_VERSION, settings
+from app.cv.model_assets import asset_status
 from app.cv.video_processor import (
     IMAGE_EXTENSIONS,
     VIDEO_EXTENSIONS,
@@ -27,7 +30,7 @@ from app.cv.video_processor import (
 )
 from app.db.database import get_db
 from app.db.models import AuditEvent, Case, Clip, CrossCameraEntity, RegistryVehicle, TrackedVehicle
-from app.engine.confusion_matrices import BODY_TYPES, COLOURS, normalise_body
+from app.engine.confusion_matrices import BODY_TYPES, COLOURS, PLATE_FORMAT_OPTIONS, normalise_body
 from app.engine.matcher import match
 from app.engine.schemas import (
     CharCandidate,
@@ -67,8 +70,14 @@ def clip_dict(clip: Clip) -> dict:
         "camera_label": clip.camera_label, "location": clip.location, "recorded_at": _iso(clip.recorded_at),
         "ingested_at": _iso(clip.ingested_at), "fps": clip.fps, "width": clip.width, "height": clip.height,
         "duration_sec": clip.duration_sec, "frame_count": clip.frame_count, "codec": clip.codec,
-        "plate_script": clip.plate_script, "processing": clip.processing,
+        "plate_script": clip.plate_script, "plate_format": clip.plate_format, "timezone": clip.timezone,
+        "latitude": clip.latitude, "longitude": clip.longitude, "synthetic": clip.filename.startswith("synthetic_"),
+        "processing": clip.processing,
     }
+
+
+def _readability(known: int) -> str:
+    return "none" if known == 0 else "partial" if known < 5 else "comparable"
 
 
 def vehicle_summary(vehicle: TrackedVehicle) -> dict:
@@ -88,6 +97,8 @@ def vehicle_summary(vehicle: TrackedVehicle) -> dict:
         "overridden": bool(vehicle.overrides),
         "link_status": vehicle.entity.review_status if vehicle.entity else None,
         "plate_script": vehicle.clip.plate_script,
+        "plate_format": vehicle.clip.plate_format,
+        "readability": _readability(result.get("known_chars", 0)),
     }
 
 
@@ -184,20 +195,56 @@ def get_case(case_id: str, session: Session = Depends(get_db)) -> dict:
     return case_dict(_case_or_404(session, case_id), detail=True)
 
 
-def _parse_time(value: str | None) -> datetime | None:
+def _zone(value: str | None) -> str | None:
+    value = (value or "").strip()
+    if not value:
+        return None
+    try:
+        ZoneInfo(value)
+    except (ZoneInfoNotFoundError, ValueError) as error:
+        raise HTTPException(422, f"Unknown timezone: {value}") from error
+    return value
+
+
+def _parse_time(value: str | None, zone: str | None = None) -> datetime | None:
+    """Store capture time in UTC. A naive time is interpreted in the camera's timezone."""
     if not value:
         return None
     try:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError as error:
         raise HTTPException(422, f"Invalid recorded_at: {value}") from error
-    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=ZoneInfo(zone) if zone else timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
-def _script(value: str) -> str:
-    if value not in {"latin", "non_latin"}:
-        raise HTTPException(422, "plate_script must be latin or non_latin")
-    return value
+def _coordinate(value: str | float | None, limit: float, name: str) -> float | None:
+    if value in (None, ""):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as error:
+        raise HTTPException(422, f"Invalid {name}") from error
+    if abs(number) > limit:
+        raise HTTPException(422, f"{name} is out of range")
+    return number
+
+
+def _plate_format(value: str | None, script: str | None = None) -> str:
+    if value:
+        if value not in PLATE_FORMAT_OPTIONS:
+            raise HTTPException(422, f"plate_format must be one of {', '.join(PLATE_FORMAT_OPTIONS)}")
+        return value
+    if script in (None, "", "latin"):
+        return "latin_any"
+    if script == "non_latin":
+        return "non_latin_digits"
+    raise HTTPException(422, "plate_script must be latin or non_latin")
+
+
+def _script_for(plate_format: str) -> str:
+    return "non_latin" if plate_format == "non_latin_digits" else "latin"
 
 
 def _store_upload(upload: UploadFile, target: Path) -> int:
@@ -222,6 +269,10 @@ def upload_clips(
     location: list[str] = Form(default=[]),
     recorded_at: list[str] = Form(default=[]),
     plate_script: list[str] = Form(default=[]),
+    plate_format: list[str] = Form(default=[]),
+    timezone_name: list[str] = Form(default=[], alias="timezone"),
+    latitude: list[str] = Form(default=[]),
+    longitude: list[str] = Form(default=[]),
     session: Session = Depends(get_db),
 ) -> dict:
     case = _case_or_404(session, case_id)
@@ -239,7 +290,9 @@ def upload_clips(
         stored = directory / f"{token}{suffix}"
         size = _store_upload(upload, stored)
         digest = sha256_file(stored)
+        os.chmod(stored, 0o444)  # Original evidence is immutable once hashed.
         if any(existing.sha256 == digest for existing in case.clips):
+            os.chmod(stored, 0o644)
             stored.unlink(missing_ok=True)
             raise HTTPException(409, f"{name} is already in this case (identical SHA-256)")
         media = stored
@@ -248,19 +301,27 @@ def upload_clips(
                 media = extract_image_sequence(stored, directory / token)
             metadata = probe_video(media)
         except Exception as error:
+            os.chmod(stored, 0o644)
             stored.unlink(missing_ok=True)
             if media != stored:
                 shutil.rmtree(media, ignore_errors=True)
             raise HTTPException(422, f"Could not read {name}: {error}") from error
         label = camera_label[index].strip() if index < len(camera_label) and camera_label[index].strip() else \
             f"Camera {len(case.clips) + 1}"
+        zone = _zone(timezone_name[index] if index < len(timezone_name) else None)
+        chosen_format = _plate_format(plate_format[index] if index < len(plate_format) else None,
+                                      plate_script[index] if index < len(plate_script) else None)
         clip = Clip(
             case_id=case.id, filename=name, stored_path=str(media), sha256=digest, size_bytes=size,
             camera_label=label, location=(location[index].strip() or None) if index < len(location) else None,
-            recorded_at=_parse_time(recorded_at[index]) if index < len(recorded_at) else None,
+            recorded_at=_parse_time(recorded_at[index] if index < len(recorded_at) else None, zone),
+            timezone=zone,
+            latitude=_coordinate(latitude[index] if index < len(latitude) else None, 90, "latitude"),
+            longitude=_coordinate(longitude[index] if index < len(longitude) else None, 180, "longitude"),
+            plate_format=chosen_format,
             fps=metadata.fps, width=metadata.width, height=metadata.height, duration_sec=metadata.duration_sec,
             frame_count=metadata.frame_count, codec=metadata.codec,
-            plate_script=_script(plate_script[index]) if index < len(plate_script) else "latin",
+            plate_script=_script_for(chosen_format),
         )
         case.clips.append(clip)
         session.flush()
@@ -276,7 +337,11 @@ class ClipUpdate(BaseModel):
     camera_label: str | None = Field(default=None, min_length=1, max_length=120)
     location: str | None = Field(default=None, max_length=200)
     recorded_at: str | None = None
+    timezone: str | None = None
+    latitude: float | None = None
+    longitude: float | None = None
     plate_script: str | None = None
+    plate_format: str | None = None
 
 
 @router.patch("/cases/{case_id}/clips/{clip_id}")
@@ -292,10 +357,17 @@ def update_clip(case_id: str, clip_id: str, body: ClipUpdate, session: Session =
         clip.camera_label = changes["camera_label"].strip()
     if "location" in changes:
         clip.location = (changes["location"] or "").strip() or None
+    if "timezone" in changes:
+        clip.timezone = _zone(changes["timezone"])
     if "recorded_at" in changes:
-        clip.recorded_at = _parse_time(changes["recorded_at"])
-    if changes.get("plate_script"):
-        clip.plate_script = _script(changes["plate_script"])
+        clip.recorded_at = _parse_time(changes["recorded_at"], clip.timezone)
+    if "latitude" in changes:
+        clip.latitude = _coordinate(changes["latitude"], 90, "latitude")
+    if "longitude" in changes:
+        clip.longitude = _coordinate(changes["longitude"], 180, "longitude")
+    if changes.get("plate_format") or changes.get("plate_script"):
+        clip.plate_format = _plate_format(changes.get("plate_format"), changes.get("plate_script"))
+        clip.plate_script = _script_for(clip.plate_format)
     session.add(AuditEvent(case_id=case.id, actor="Investigator", action="CLIP_METADATA_UPDATED", field=clip.camera_label,
                            note=", ".join(sorted(changes)) or "no change"))
     session.commit()
@@ -307,6 +379,10 @@ def analyze_case(case_id: str, session: Session = Depends(get_db)) -> dict:
     case = _case_or_404(session, case_id)
     if not case.clips:
         raise HTTPException(422, "Upload at least one clip first")
+    assets = asset_status()
+    if not assets["ready"]:
+        raise HTTPException(503, f"Missing {', '.join(assets['missing'])}. From the backend folder, run: "
+                                 f"{assets['install_command']}")
     if not submit_case(case_id):
         raise HTTPException(409, "Analysis is already running")
     case.status = "QUEUED"
@@ -438,17 +514,25 @@ def review_entity(case_id: str, entity_id: str, body: EntityReview, session: Ses
     return entity_dict(entity)
 
 
+def _report_scope(session: Session, case_id: str, clip_id: str | None) -> None:
+    case = _case_or_404(session, case_id)
+    if clip_id and not any(clip.id == clip_id for clip in case.clips):
+        raise HTTPException(404, "Clip not found in this case")
+
+
 @router.get("/cases/{case_id}/report/html", response_class=HTMLResponse)
-def report_html(case_id: str, download: bool = False, session: Session = Depends(get_db)) -> HTMLResponse:
-    _case_or_404(session, case_id)
+def report_html(case_id: str, download: bool = False, clip_id: str | None = None,
+                session: Session = Depends(get_db)) -> HTMLResponse:
+    _report_scope(session, case_id, clip_id)
     headers = {"Content-Disposition": f'attachment; filename="forensic_report_{case_id}.html"'} if download else {}
-    return HTMLResponse(render_html(session, case_id), headers=headers)
+    return HTMLResponse(render_html(session, case_id, clip_id=clip_id), headers=headers)
 
 
 @router.get("/cases/{case_id}/report/pdf")
-def report_pdf(case_id: str, appendix: bool = False, session: Session = Depends(get_db)) -> Response:
-    _case_or_404(session, case_id)
-    data, engine = render_pdf(session, case_id, appendix)
+def report_pdf(case_id: str, appendix: bool = False, clip_id: str | None = None,
+               session: Session = Depends(get_db)) -> Response:
+    _report_scope(session, case_id, clip_id)
+    data, engine = render_pdf(session, case_id, appendix, clip_id)
     return Response(data, media_type="application/pdf", headers={
         "Content-Disposition": f'attachment; filename="forensic_report_{case_id}.pdf"',
         "X-PDF-Engine": engine,
@@ -577,6 +661,7 @@ def upload_registry(
 class MatchTest(BaseModel):
     plate: str = Field(default="", max_length=16)
     plate_confidence: float = Field(default=0.9, ge=0.01, le=1.0)
+    plate_format: str = "latin_any"
     anchor: str | None = None
     colour: str | None = None
     secondary_colour: str | None = None
@@ -603,6 +688,7 @@ def match_test(body: MatchTest, session: Session = Depends(get_db)) -> dict:
             plate=PlateEvidence.from_text(body.plate, body.plate_confidence, body.anchor or None),
             colours=colours, body_type=body.body_type or None,
             body_confidence=body.body_confidence if body.body_type else 0.0, make_models=make_models,
+            plate_format=_plate_format(body.plate_format),
         )
     except ValidationError as error:
         raise HTTPException(422, str(error)) from error

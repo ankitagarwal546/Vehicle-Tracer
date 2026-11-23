@@ -36,7 +36,8 @@
 </style>
 </head>
 <body><main>
-<h1>Vehicle Identification Forensic Report</h1>
+<h1>Vehicle Identification Forensic Report{% if scope_label %}: {{ scope_label }}{% endif %}</h1>
+{% if has_synthetic_clip %}<div class="verdict warn"><strong>Synthetic test fixture</strong> Clips, plates, vehicles and owners in this report are fictional.</div>{% endif %}
 <div class="muted">Case <span class="mono">{{ case.id }}</span> · {{ case.title }} · Generated {{ generated_at }} UTC · Pipeline {{ case.pipeline_version or "n/a" }}</div>
 
 <h2>Executive Summary</h2>
@@ -57,28 +58,36 @@
 <p class="note">Results are investigative leads and do not establish vehicle or owner identity. Unreadable characters remain <span class="mono">?</span> and are never inferred. Match scores are uncalibrated ranking values, not probabilities. {{ registry_note }}{% if missing_time %} {{ missing_time }} clip(s) have no capture time, so temporal checks involving them were not validated.{% endif %}</p>
 
 <h2>Evidence Integrity</h2>
-<div class="scroll"><table><tr><th>Camera</th><th>File</th><th>SHA-256</th><th>Ingested (UTC)</th><th>Capture time</th><th>Technical</th></tr>
-{% for clip in clips %}<tr><td>{{ clip.camera_label }}{% if clip.location %}<br><span class="muted">{{ clip.location }}</span>{% endif %}{% if clip.plate_script == "non_latin" %}<br><span class="muted">Plate letters withheld (non-Latin script)</span>{% endif %}</td><td>{{ clip.filename }}</td><td class="mono hash">{{ clip.sha256 }}</td><td class="mono">{{ clip.ingested_at }}</td><td class="mono">{{ clip.recorded_at or "Not supplied" }}</td><td class="mono">{{ clip.width }}x{{ clip.height }} · {{ clip.fps }} fps · {{ clip.duration_sec }} s · {{ clip.codec }}</td></tr>{% endfor %}
+<div class="scroll"><table><tr><th>Camera</th><th>File</th><th>SHA-256</th><th>Ingested (UTC)</th><th>Capture time (UTC)</th><th>Plate format</th><th>Technical</th></tr>
+{% for clip in clips %}<tr><td>{{ clip.camera_label }}{% if clip.location %}<br><span class="muted">{{ clip.location }}</span>{% endif %}</td><td>{{ clip.filename }}</td><td class="mono hash">{{ clip.sha256 }}</td><td class="mono">{{ clip.ingested_at }}</td><td class="mono">{{ clip.recorded_at or "Not supplied" }}{% if clip.timezone %}<br><span class="muted">{{ clip.timezone }}</span>{% endif %}</td><td>{{ clip.plate_format }}</td><td class="mono">{{ clip.width }}x{{ clip.height }} · {{ clip.fps }} fps · {{ clip.duration_sec }} s · {{ clip.codec }}</td></tr>{% endfor %}
 </table></div>
 
 <h2>Shortlist Results</h2>
+<p class="note">Registry plates are ordered by plate evidence. Attributes only break plate ties.</p>
 {% if key_vehicles %}{% for v in key_vehicles %}
 <section class="evidence">
   <h3 style="margin-top:0">{{ v.camera_label }} · Track {{ v.track_id }} · <span class="mono">{{ v.match.query_plate or "plate not read" }}</span> · {{ v.outcome_label }}{% if v.overrides %} · includes investigator-verified values; AI read <span class="mono">{{ v.fused_plate.text or "unread" }}</span>{% endif %}</h3>
   <div class="evidence-grid">
-    <div>{% set k = v.keyframes[0] if v.keyframes else none %}{% if k and k.crop_uri %}<img src="{{ k.crop_uri }}" alt="Vehicle crop">{% endif %}
+    <div>{% set k = v.keyframes[0] if v.keyframes else none %}{% if k and k.frame_uri %}<img src="{{ k.frame_uri }}" alt="Annotated keyframe">{% endif %}
       {% if k and k.raw_uri %}<div class="plates"><div>Raw<img src="{{ k.raw_uri }}" alt="Raw plate"></div><div>Enhanced<img src="{{ k.enhanced_uri }}" alt="Enhanced plate"></div></div>{% endif %}
     </div>
     <div>
       <div class="muted">{{ v.first_seen_sec }}–{{ v.last_seen_sec }} s · {{ v.attr_line }}</div>
+      <div class="note">{{ v.provenance }}</div>
+      <div style="margin:4px 0">{% for s in v.fused_plate.slots %}<span class="char {{ 'unknown' if s.char == '?' else '' }}">{{ s.char }}</span>{% endfor %}</div>
       <div class="scroll"><table><tr><th>#</th><th>Registry plate</th><th>Vehicle</th><th>Status</th><th>Score</th></tr>
       {% for c in (v.match.candidates or v.match.rejected_candidates)[:3] %}<tr><td class="mono">{{ c.rank }}</td><td>{% for d in c.slot_diff %}<span class="char {{ d.kind }}">{{ d.registry }}</span>{% endfor %}</td><td>{{ c.vehicle.colour }} {{ c.vehicle.make }} {{ c.vehicle.model }} ({{ c.vehicle.body_type|pretty }})</td><td>{{ c.vehicle.status|pretty|lower }}</td><td class="mono">{{ "%.1f"|format(c.score) }}</td></tr>{% endfor %}</table></div>
-      <ul>{% for d in v.match.diagnostics %}<li>{{ d }}</li>{% endfor %}</ul>
+      <ul>{% for d in v.match.diagnostics %}<li>{{ d }}</li>{% endfor %}{% for n in v.unknown_notes %}<li>{{ n }}</li>{% endfor %}{% set lead = (v.match.candidates or v.match.rejected_candidates) %}{% if lead %}{% for r in lead[0].reasons[:4] %}<li>{{ r }}</li>{% endfor %}{% endif %}</ul>
     </div>
   </div>
 </section>{% endfor %}
 {% if hidden_key %}<p class="note">{{ hidden_key }} further track(s) with registry candidates are listed in the appendix.</p>{% endif %}
 {% else %}<p>No track had enough plate evidence to shortlist a registry vehicle. See the outcome counts above.</p>{% endif %}
+
+{% if no_match_rows %}<h2>No-Match Outcomes</h2>
+<div class="scroll"><table><tr><th>Camera</th><th>Track</th><th>Recovered plate</th><th>Reason</th></tr>
+{% for v in no_match_rows %}<tr><td>{{ v.camera_label }}</td><td class="mono">{{ v.track_id }}</td><td class="mono">{{ v.match.query_plate }}</td><td>{{ v.match.diagnostics[0] if v.match.diagnostics else "No registry match" }}</td></tr>{% endfor %}</table></div>
+{% if hidden_no_match %}<p class="note">{{ hidden_no_match }} more are listed in the appendix.</p>{% endif %}{% endif %}
 
 <h2>Cross-Camera Links</h2>
 {% if entities %}<div class="scroll"><table><tr><th>Review status</th><th>Evidence</th><th>Sightings</th><th>Plate if merged</th><th>Temporal check</th></tr>
@@ -86,9 +95,10 @@
 <p class="note">A possible link is unverified until an investigator confirms it.</p>
 {% else %}<p>No pair of tracks had enough independent evidence to propose a link.</p>{% endif %}
 
-{% if overrides %}<h2>Investigator Changes</h2>
-<div class="scroll"><table><tr><th>Time (UTC)</th><th>Actor</th><th>Field</th><th>AI extracted</th><th>Investigator</th></tr>
-{% for e in overrides %}<tr><td class="mono">{{ e.created_at }}</td><td>{{ e.actor }}</td><td>{{ e.field or e.action }}</td><td class="mono">{{ e.ai_extracted or "" }}</td><td class="mono">{{ e.investigator_verified or "" }}</td></tr>{% endfor %}</table></div>{% endif %}
+<h2>Audit Log</h2>
+<div class="scroll"><table><tr><th>Time (UTC)</th><th>Actor</th><th>Action</th><th>Field</th><th>AI extracted</th><th>Investigator</th></tr>
+{% for e in audit_recent %}<tr><td class="mono">{{ e.created_at }}</td><td>{{ e.actor }}</td><td>{{ e.action|pretty|lower }}</td><td>{{ e.field or "" }}</td><td class="mono hash">{{ e.ai_extracted or "" }}</td><td class="mono">{{ e.investigator_verified or "" }}</td></tr>{% endfor %}</table></div>
+<p class="note">Showing the latest {{ audit_recent|length }} of {{ audit|length }} events.</p>
 
 {% if appendix %}
 <h2>Appendix</h2>

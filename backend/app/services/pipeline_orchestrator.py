@@ -4,9 +4,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import shutil
+import os
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import timedelta, timezone
@@ -23,11 +24,13 @@ from app.cv import make_model
 from app.cv.clip_service import ClipService
 from app.cv.detector_tracker import VehicleDetectorTracker, VehicleTrack, apply_stitching
 from app.cv.device import active_device
+from app.cv.model_assets import INSTALL_COMMAND, ModelsNotInstalled, asset_status, require_analysis_models
 from app.cv.plate_fusion import FusedPlate, PlateRead, fuse_plate_reads
 from app.cv.plate_ocr import PlateObservation, PlateReader
+from app.cv.plate_variants import VARIANTS
 from app.cv.reid import TrackProfile, link_tracks, mean_embedding, spatial_hsv_histogram
 from app.cv.track_stitcher import plan_merges
-from app.cv.video_processor import SamplingStats, probe_video, sample_frames
+from app.cv.video_processor import SamplingStats, probe_video, sample_frames, sha256_file
 from app.db.database import SessionLocal
 from app.db.models import AuditEvent, Case, Clip, CrossCameraEntity, RegistryVehicle, TrackedVehicle
 from app.engine.matcher import RegistryIndex, match
@@ -103,6 +106,7 @@ class ModelHub:
     def load(self) -> None:
         with self._lock:
             if self.detector is None:
+                require_analysis_models()
                 try:
                     self.detector = VehicleDetectorTracker()
                     self.detector_error = None
@@ -110,7 +114,12 @@ class ModelHub:
                     self.detector_error = f"{type(error).__name__}: {error}"
                     raise RuntimeError(f"Vehicle detector could not be loaded: {self.detector_error}") from error
             if self.reader is None:
-                self.reader = PlateReader()
+                reader = PlateReader()
+                if reader.engine is None:
+                    details = "; ".join(f"{name}: {error}" for name, error in reader.errors.items())
+                    raise ModelsNotInstalled(f"No plate OCR engine could be loaded ({details}). "
+                                             f"From the backend folder, run: {INSTALL_COMMAND}")
+                self.reader = reader
             if self.clip is None:
                 self.clip = ClipService()
 
@@ -125,6 +134,7 @@ class ModelHub:
             "clip": {"loaded": bool(self.clip and self.clip.available), "model": settings.clip_model,
                      "error": self.clip.error if self.clip else None},
             "device": active_device(),
+            "assets": asset_status(),
         }
 
 
@@ -191,7 +201,7 @@ def load_registry(session: Session) -> RegistryIndex:
         return _registry_cache
 
 
-def build_query(plate: PlateEvidence, attrs: dict) -> QueryEvidence:
+def build_query(plate: PlateEvidence, attrs: dict, plate_format: str = "latin_any") -> QueryEvidence:
     body = attrs.get("body_type") or {}
     make_models = [
         MakeModelScore(make=m["make"], model=m["model"], confidence=m["confidence"])
@@ -203,6 +213,7 @@ def build_query(plate: PlateEvidence, attrs: dict) -> QueryEvidence:
         body_type=body.get("label"),
         body_confidence=body.get("confidence", 0.0),
         make_models=make_models,
+        plate_format=plate_format,
     )
 
 
@@ -218,13 +229,26 @@ class TrackAnalysis:
     stacked_plate: np.ndarray | None = None
 
 
-def _write_image(path: Path, image: np.ndarray, quality: int = 90) -> str:
+def _write_image(path: Path, image: np.ndarray, quality: int = 90, read_only: bool = False) -> str:
     path.parent.mkdir(parents=True, exist_ok=True)
-    cv2.imwrite(str(path), image, [cv2.IMWRITE_JPEG_QUALITY, quality])
+    params = [cv2.IMWRITE_JPEG_QUALITY, quality] if path.suffix == ".jpg" else []
+    cv2.imwrite(str(path), image, params)
+    if read_only:
+        os.chmod(path, 0o444)
     return path.relative_to(settings.artifact_dir).as_posix()
 
 
-def _analyse_track(track: VehicleTrack, digits_only: bool = False) -> TrackAnalysis:
+def verify_clip_integrity(clip: Clip) -> None:
+    """Refuse to analyse evidence that no longer matches its ingest hash."""
+    stored = Path(clip.stored_path)
+    source = stored.with_suffix(".zip") if stored.is_dir() else stored
+    if not source.exists():
+        raise ValueError(f"Evidence file for {clip.camera_label} is missing")
+    if sha256_file(source) != clip.sha256:
+        raise ValueError(f"Evidence file for {clip.camera_label} no longer matches its ingest SHA-256")
+
+
+def _analyse_track(track: VehicleTrack, digits_only: bool = False, artifact_base: Path | None = None) -> TrackAnalysis:
     observations = track.observations
     plate_results: list[PlateObservation] = []
     boxes_by_frame: dict[int, tuple[int, int, int, int]] = {}
@@ -237,6 +261,10 @@ def _analyse_track(track: VehicleTrack, digits_only: bool = False) -> TrackAnaly
             if not plate_results and misses >= MAX_PLATE_MISSES:
                 break  # The best views show no plate, so weaker views will not help.
             continue
+        if artifact_base is not None:
+            # Raw crops are lossless and read-only. Every later view is an additional artifact.
+            result.read.crop = _write_image(artifact_base / f"plate_raw_f{item.frame_idx}.png", result.raw_crop,
+                                            read_only=True)
         plate_results.append(result)
         boxes_by_frame[item.frame_idx] = result.bbox_in_crop
     reads = [result.read for result in plate_results]
@@ -280,15 +308,14 @@ def _stitch_tracks(tracks: list[VehicleTrack]) -> tuple[list[VehicleTrack], int]
     return kept, len(decisions)
 
 
-def _persist_track(session: Session, case: Case, clip: Clip, analysis: TrackAnalysis,
-                   registry: RegistryIndex) -> tuple[TrackedVehicle, TrackProfile]:
+def _persist_track(session: Session, case: Case, clip: Clip, analysis: TrackAnalysis, registry: RegistryIndex,
+                   base: Path) -> tuple[TrackedVehicle, TrackProfile]:
     track = analysis.track
     vehicle = TrackedVehicle(case_id=case.id, clip_id=clip.id, track_id=track.track_id,
                              first_seen_sec=round(track.first_seen_sec, 3),
                              last_seen_sec=round(track.last_seen_sec, 3), frames_tracked=track.frames_tracked)
     session.add(vehicle)
     session.flush()
-    base = settings.artifact_dir / case.id / clip.id / f"track_{track.track_id}"
     by_frame = {obs.read.frame_idx: obs for obs in analysis.observations}
     observations = track.observations
     ordered = sorted(observations, key=lambda o: (
@@ -312,29 +339,52 @@ def _persist_track(session: Session, case: Case, clip: Clip, analysis: TrackAnal
             "frame_idx": item.frame_idx,
             "timestamp_sec": round(item.timestamp_sec, 3),
             "sharpness": round(item.sharpness, 2),
+            "frame_sharpness": round(item.frame_sharpness, 2),
+            "brightness": round(item.frame_brightness, 1),
+            "contrast": round(item.frame_contrast, 1),
+            "low_sharpness": item.low_sharpness,
             "bbox": list(item.bbox),
             "frame": _write_image(base / f"frame_{index}.jpg", frame, 82),
             "crop": _write_image(base / f"crop_{index}.jpg", item.crop),
         }
         plate = by_frame.get(item.frame_idx)
         if plate:
+            views = []
+            for name, info in VARIANTS.items():
+                image = plate.variants.get(name)
+                if image is None:
+                    continue
+                output = plate.variant_outputs.get(name)
+                path = plate.read.crop if name == "raw" else _write_image(base / f"plate_f{item.frame_idx}_{name}.png", image)
+                views.append({"name": name, "label": info["label"], "kind": info["kind"], "image": path,
+                              "text": output.text if output else "",
+                              "mean_confidence": round(output.score, 4) if output else 0.0})
+            enhanced = next(view["image"] for view in views if view["name"] == "gray_clahe")
             entry.update({
-                "plate_raw": _write_image(base / f"plate_raw_{index}.jpg", plate.raw_crop, 95),
-                "plate_enhanced": _write_image(base / f"plate_enh_{index}.jpg", plate.enhanced_crop, 95),
+                "plate_raw": plate.read.crop,
+                "plate_enhanced": enhanced,
                 "plate_text": plate.read.raw_text,
                 "plate_quality": round(plate.quality, 3),
+                "plate_box_confidence": round(plate.box_confidence, 4),
+                "plate_crop_size": [int(plate.raw_crop.shape[1]), int(plate.raw_crop.shape[0])],
+                "crop_sha256": plate.read.crop_sha256,
+                "ocr_engine": plate.read.ocr_engine,
                 "ocr_source": plate.read.source,
+                "rectification": plate.rectification.as_dict(),
+                "variants": views,
             })
         keyframes.append(entry)
 
     evidence = analysis.fused.to_evidence()
-    query = build_query(evidence, analysis.attributes)
+    query = build_query(evidence, analysis.attributes, clip.plate_format)
     vehicle.best_crop = keyframes[0]["crop"] if keyframes else None
     vehicle.keyframes = keyframes
-    vehicle.plate_reads = [_read_dict(obs.read) for obs in analysis.observations]
+    vehicle.plate_reads = [{**_read_dict(obs.read), "plate_box_confidence": round(obs.box_confidence, 4),
+                            "plate_crop_size": [int(obs.raw_crop.shape[1]), int(obs.raw_crop.shape[0])],
+                            "rectification": obs.rectification.status} for obs in analysis.observations]
     vehicle.fused_plate = {
         **analysis.fused.to_dict(),
-        "stack_crop": _write_image(base / "plate_stack.jpg", analysis.stacked_plate, 95)
+        "stack_crop": _write_image(base / "plate_stack.png", analysis.stacked_plate)
         if analysis.stacked_plate is not None else None,
     }
     vehicle.attributes = {
@@ -357,6 +407,7 @@ def _persist_track(session: Session, case: Case, clip: Clip, analysis: TrackAnal
         histogram=analysis.histogram, plate_text=analysis.fused.text,
         body_type=analysis.attributes["body_type"]["label"], colours=analysis.attributes["colours"],
         make_models=make_models, start=start, end=end, location=clip.location,
+        latitude=clip.latitude, longitude=clip.longitude, plate_format=clip.plate_format,
     )
     return vehicle, profile
 
@@ -364,28 +415,37 @@ def _persist_track(session: Session, case: Case, clip: Clip, analysis: TrackAnal
 def _read_dict(read: PlateRead) -> dict:
     return {"frame_idx": read.frame_idx, "timestamp_sec": round(read.timestamp_sec, 3), "raw_text": read.raw_text,
             "char_confidences": [round(v, 4) for v in read.char_confidences],
+            "char_alternatives": [[[c, round(p, 4)] for c, p in slot] for slot in read.char_alternatives],
+            "char_source_supported": read.char_source_supported, "char_variants": read.char_variants,
             "sharpness_score": round(read.sharpness_score, 3), "bbox_area": read.bbox_area,
-            "ocr_engine_score": round(read.ocr_engine_score, 4), "source": read.source, "derived": read.derived}
+            "ocr_engine_score": round(read.ocr_engine_score, 4), "source": read.source, "derived": read.derived,
+            "ocr_engine": read.ocr_engine, "crop": read.crop, "crop_sha256": read.crop_sha256}
 
 
 def _read_from_dict(item: dict) -> PlateRead:
-    return PlateRead(item["frame_idx"], item["timestamp_sec"], item["raw_text"], item["char_confidences"],
-                     item["sharpness_score"], item["bbox_area"], item["ocr_engine_score"], item.get("source", ""),
-                     item.get("derived", False))
+    return PlateRead(
+        item["frame_idx"], item["timestamp_sec"], item["raw_text"], item["char_confidences"],
+        item["sharpness_score"], item["bbox_area"], item["ocr_engine_score"], item.get("source", ""),
+        item.get("derived", False),
+        [[(c, p) for c, p in slot] for slot in item.get("char_alternatives", [])],
+        item.get("char_source_supported", []), item.get("char_variants", []), item.get("ocr_engine", ""),
+        item.get("crop"), item.get("crop_sha256"),
+    )
 
 
 def _build_entities(session: Session, case: Case, vehicles: dict[str, TrackedVehicle],
                     profiles: list[TrackProfile], registry: RegistryIndex) -> tuple[int, int]:
     groups, links, blocked = link_tracks(profiles)
-    tier_order = ["visual_time", "partial_plate", "strong_plate"]
+    tier_order = ["partial_plate", "strong_plate"]
     for group in groups:
         members = [vehicles[vehicle_id] for vehicle_id in group]
         merged_reads: list[PlateRead] = []
         for member in members:
             merged_reads.extend(_read_from_dict(item) for item in member.plate_reads)
-        fused = fuse_plate_reads(merged_reads, digits_only=any(m.clip.plate_script == "non_latin" for m in members))
+        fused = fuse_plate_reads(merged_reads, digits_only=any(m.clip.plate_format == "non_latin_digits" for m in members))
         best = max(members, key=lambda v: v.frames_tracked)
-        query = build_query(fused.to_evidence(), best.attributes)
+        formats = {m.clip.plate_format for m in members} - {"latin_any"}
+        query = build_query(fused.to_evidence(), best.attributes, formats.pop() if len(formats) == 1 else "latin_any")
         timeline = []
         for member in members:
             clip = member.clip
@@ -395,7 +455,7 @@ def _build_entities(session: Session, case: Case, vehicles: dict[str, TrackedVeh
                 absolute = (recorded + timedelta(seconds=member.first_seen_sec)).isoformat()
             timeline.append({
                 "vehicle_id": member.id, "clip_id": clip.id, "camera_label": clip.camera_label,
-                "location": clip.location, "first_seen_sec": member.first_seen_sec,
+                "location": clip.location, "timezone": clip.timezone, "first_seen_sec": member.first_seen_sec,
                 "last_seen_sec": member.last_seen_sec, "absolute_time": absolute,
                 "plate": member.fused_plate.get("text", ""), "best_crop": member.best_crop,
             })
@@ -456,7 +516,7 @@ def run_pipeline(case_id: str) -> None:
         session.execute(delete(CrossCameraEntity).where(CrossCameraEntity.case_id == case.id))
         session.commit()
         session.expire_all()
-        shutil.rmtree(settings.artifact_dir / case.id, ignore_errors=True)
+        run_id = f"run_{uuid.uuid4().hex[:10]}"  # Earlier runs' raw crops are preserved, not overwritten.
         registry = load_registry(session)
         clips = list(session.get(Case, case_id).clips)
 
@@ -467,6 +527,7 @@ def run_pipeline(case_id: str) -> None:
             base = 5 + span * clip_index
             label = clip.camera_label
             path = Path(clip.stored_path)
+            verify_clip_integrity(clip)
             metadata = probe_video(path)
             estimated = max(min(int(metadata.duration_sec * settings.sample_fps), settings.max_frames_per_clip), 1)
             stats = SamplingStats()
@@ -485,14 +546,18 @@ def run_pipeline(case_id: str) -> None:
             for track_index, track in enumerate(tracks):
                 publish("recognition", base + span * (0.5 + 0.5 * track_index / max(len(tracks), 1)),
                         f"{label}: reading plate and attributes for vehicle {track_index + 1} of {len(tracks)}")
-                analysis = _analyse_track(track, digits_only=clip.plate_script == "non_latin")
-                vehicle, profile = _persist_track(session, case, clip, analysis, registry)
+                artifact_base = settings.artifact_dir / case.id / run_id / clip.id / f"track_{track.track_id}"
+                analysis = _analyse_track(track, digits_only=clip.plate_format == "non_latin_digits",
+                                          artifact_base=artifact_base)
+                vehicle, profile = _persist_track(session, case, clip, analysis, registry, artifact_base)
                 vehicles[vehicle.id] = vehicle
                 profiles.append(profile)
             session.commit()
 
         publish("reid", 93, "Linking vehicles across cameras")
         entity_count, blocked_links = _build_entities(session, case, vehicles, profiles, registry)
+        session.add(AuditEvent(case_id=case.id, actor="system", action="EVIDENCE_VERIFIED",
+                               note=f"All {len(clips)} clip hash(es) matched before analysis ({run_id})"))
         publish("report", 98, "Finalising case record")
         case.status = "COMPLETED"
         case.runtime = {**models.status(), "elapsed_sec": round(time.perf_counter() - started, 2),
