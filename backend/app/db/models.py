@@ -43,6 +43,8 @@ class Case(Base):
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     pipeline_version: Mapped[str | None] = mapped_column(String(24), nullable=True)
     runtime: Mapped[dict] = mapped_column(JSON, default=dict)
+    active_run_id: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    live_run_id: Mapped[str | None] = mapped_column(String(16), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
@@ -52,6 +54,26 @@ class Case(Base):
     audit_events: Mapped[list["AuditEvent"]] = relationship(
         back_populates="case", cascade="all, delete-orphan", order_by="AuditEvent.created_at"
     )
+
+    @property
+    def completed_vehicles(self) -> list["TrackedVehicle"]:
+        """Tracks from the last finished run. A running or failed run never appears here."""
+        return [v for v in self.vehicles if v.run_id == self.active_run_id]
+
+    @property
+    def completed_entities(self) -> list["CrossCameraEntity"]:
+        return [e for e in self.entities if e.run_id == self.active_run_id]
+
+    @property
+    def display_vehicles(self) -> list["TrackedVehicle"]:
+        """Live tracks during a run, otherwise the last finished run."""
+        run = self.live_run_id or self.active_run_id
+        return [v for v in self.vehicles if v.run_id == run]
+
+    @property
+    def display_entities(self) -> list["CrossCameraEntity"]:
+        run = self.live_run_id or self.active_run_id
+        return [e for e in self.entities if e.run_id == run]
 
 
 class Clip(Base):
@@ -93,6 +115,7 @@ class CrossCameraEntity(Base):
     timeline: Mapped[list] = mapped_column(JSON, default=list)
     links: Mapped[list] = mapped_column(JSON, default=list)
     match_result: Mapped[dict] = mapped_column(JSON, default=dict)
+    run_id: Mapped[str | None] = mapped_column(String(16), nullable=True, index=True)
     review_status: Mapped[str] = mapped_column(String(16), default="proposed", index=True)
     evidence_tier: Mapped[str] = mapped_column(String(32), default="unverified")
     reviewed_by: Mapped[str | None] = mapped_column(String(120), nullable=True)
@@ -113,6 +136,7 @@ class TrackedVehicle(Base):
     entity_id: Mapped[str | None] = mapped_column(
         ForeignKey("cross_camera_entities.id", ondelete="SET NULL"), nullable=True, index=True
     )
+    run_id: Mapped[str | None] = mapped_column(String(16), nullable=True, index=True)
     track_id: Mapped[int] = mapped_column(Integer)
     first_seen_sec: Mapped[float] = mapped_column(Float)
     last_seen_sec: Mapped[float] = mapped_column(Float)

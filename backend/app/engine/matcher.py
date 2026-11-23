@@ -13,6 +13,7 @@ Colour, body type and make/model only support a plate-based match. A vehicle can
 """
 from __future__ import annotations
 
+import hashlib
 import time
 from collections.abc import Iterable
 from itertools import combinations
@@ -24,6 +25,7 @@ from .confusion_matrices import (
     body_similarity,
     colour_similarity,
     expected_char_classes,
+    PLATE_FORMAT_NAMES,
     format_accepts,
     is_confusable,
     normalise_body,
@@ -35,6 +37,7 @@ from .schemas import (
     MatchResult,
     PlateEvidence,
     QueryEvidence,
+    RegistryCoverage,
     RegistryRecord,
     SlotDiff,
     SlotEvidence,
@@ -241,6 +244,7 @@ class RegistryIndex:
 
     def __init__(self, records: Iterable[RegistryRecord]) -> None:
         self.records = list(records)
+        self._fingerprint: str | None = None
         groups: dict[int, list[int]] = {}
         for index, record in enumerate(self.records):
             groups.setdefault(len(record.plate), []).append(index)
@@ -263,6 +267,24 @@ class RegistryIndex:
             return np.zeros(0, dtype=bool)
         return np.asarray([format_accepts(plate_format, family) for family in self.families],
                           dtype=bool)[self.family_codes]
+
+    def compatible_count(self, plate_format: str) -> int:
+        return int(self.eligible(plate_format).sum())
+
+    def family_counts(self) -> dict[str, int]:
+        if not self.records:
+            return {}
+        counts = np.bincount(self.family_codes, minlength=len(self.families))
+        return {family: int(count) for family, count in zip(self.families, counts)}
+
+    def fingerprint(self) -> str:
+        """Identify registry content, so a case can tell when it was scored on an older registry."""
+        if self._fingerprint is None:
+            digest = hashlib.sha256()
+            for row in sorted(f"{r.plate}|{r.status}|{r.source}" for r in self.records):
+                digest.update(row.encode("ascii", "replace"))
+            self._fingerprint = digest.hexdigest()[:16]
+        return self._fingerprint
 
     @staticmethod
     def _encode(values: Iterable) -> tuple[list, np.ndarray]:
@@ -482,24 +504,28 @@ def match(
     outcome = "NO_REGISTRY_MATCH"
     top = shortlist[0] if shortlist else None
 
-    if not records:
-        codes.append("EMPTY_REGISTRY")
-        diagnostics.append("The registry is empty.")
-    elif known == 0:
+    compatible = int(eligible.sum())
+    format_name = PLATE_FORMAT_NAMES.get(query.plate_format, query.plate_format.replace("_", " "))
+    no_coverage_note = (f"The active registry has 0 compatible {format_name} records out of {len(records):,}, "
+                        "so no registry comparison was possible.")
+    if known == 0:
         outcome = "UNREADABLE_PLATE"
         codes.append("NO_PLATE_EVIDENCE")
         diagnostics.append("No plate character could be read, so no registry vehicle can be identified. "
                            "Colour, body type and model alone never identify a vehicle.")
+        if compatible == 0:
+            diagnostics.append(no_coverage_note)
     elif known < t["min_readable_chars"]:
         outcome = "INSUFFICIENT_PLATE"
         codes.append("TOO_FEW_CHARACTERS")
         diagnostics.append(f"Only {known} plate character(s) are readable; at least "
                            f"{t['min_readable_chars']:.0f} are required before a vehicle can be shortlisted.")
+        if compatible == 0:
+            diagnostics.append(no_coverage_note)
     elif top is None:
-        codes.append("FORMAT_NOT_IN_REGISTRY")
-        label = query.plate_format.replace("_", " ")
-        diagnostics.append(f"The registry contains no plates in this camera's format ({label}), so this read "
-                           "cannot match any registry vehicle.")
+        outcome = "NO_REGISTRY_COVERAGE"
+        codes.append("NO_REGISTRY_COVERAGE")
+        diagnostics.append(f"{no_coverage_note} The plate read is kept as OCR evidence. This is not a no-match result.")
     else:
         if query.body_type and query.body_confidence > 0 and body is not None \
                 and bool(np.all(body < MIN_BODY_COMPATIBILITY)):
@@ -530,6 +556,8 @@ def match(
         "registry_size": len(records),
         "reason_codes": codes,
         "thresholds": dict(t),
+        "registry_coverage": RegistryCoverage(plate_format=query.plate_format, compatible_records=compatible,
+                                              total_records=len(records), searched=compatible > 0 and known >= t["min_readable_chars"]),
     }
     if codes or top is None:
         # Show only registry plates that genuinely share characters with the read.

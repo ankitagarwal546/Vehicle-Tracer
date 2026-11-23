@@ -34,6 +34,8 @@ FULL_PLATE_SLOTS = 9
 MAX_SLOT_EVIDENCE = 12
 CONFLICT_RUNNER_UP = 0.25
 MIN_CONFLICT_FRAMES = 2
+# A character needs a clear majority of the frames that saw its position.
+MIN_FRAME_AGREEMENT = 2 / 3
 MIN_SLOT_OBSERVATION_SHARE = 0.3
 
 
@@ -434,6 +436,8 @@ def fuse_plate_reads(
         elif len(ranked) > 1 and ranked[1][1] >= CONFLICT_RUNNER_UP \
                 and (fused < tau or len(confidences.get(ranked[1][0], [])) >= MIN_CONFLICT_FRAMES):
             reason = f"frames disagree between {winner} and {ranked[1][0]}"
+        elif observed >= 2 and support < MIN_FRAME_AGREEMENT * observed - 1e-9:
+            reason = f"only {support} of {observed} frames agree on {winner}"
         elif fused < tau:
             reason = f"fused confidence {fused:.2f} is below {tau:.2f}"
         elif support < 2 and max(confidences[winner]) < single_min:

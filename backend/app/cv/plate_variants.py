@@ -26,7 +26,10 @@ VARIANTS: dict[str, dict] = {
     "gray_clahe": {"label": "Grayscale + CLAHE", "kind": "filtered", "weight": 0.4},
     "denoised": {"label": "Denoised", "kind": "filtered", "weight": 0.4},
     "unsharp": {"label": "Restrained unsharp", "kind": "filtered", "weight": 0.3},
+    "gamma": {"label": "Gamma corrected", "kind": "filtered", "weight": 0.3},
 }
+# These views are read for every plate. The rest are read when these disagree or are uncertain.
+CORE_VARIANTS = ("raw", "gray_clahe", "upscale_2x")
 
 
 @dataclass(frozen=True)
@@ -115,6 +118,15 @@ def unsharp_view(image: np.ndarray) -> np.ndarray:
     return cv2.cvtColor(cv2.addWeighted(gray, 1.35, blurred, -0.35, 0), cv2.COLOR_GRAY2BGR)
 
 
+def gamma_view(image: np.ndarray) -> np.ndarray:
+    """Move mid-tones toward neutral with a bounded gamma. No spatial detail is added."""
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    mean = float(np.clip(gray.mean() / 255.0, 0.05, 0.95))
+    gamma = float(np.clip(np.log(0.5) / np.log(mean), 0.6, 1.6))
+    table = np.clip(((np.arange(256) / 255.0) ** gamma) * 255.0, 0, 255).astype(np.uint8)
+    return cv2.cvtColor(cv2.LUT(gray, table), cv2.COLOR_GRAY2BGR)
+
+
 def build_variants(raw: np.ndarray) -> tuple[dict[str, np.ndarray], Rectification]:
     """Build derivatives. The raw array is copied, so the source crop is never altered."""
     views = {
@@ -124,6 +136,7 @@ def build_variants(raw: np.ndarray) -> tuple[dict[str, np.ndarray], Rectificatio
         "gray_clahe": clahe_view(raw),
         "denoised": denoised_view(raw),
         "unsharp": unsharp_view(raw),
+        "gamma": gamma_view(raw),
     }
     warped, rectification = rectify_plate(raw)
     if warped is not None:

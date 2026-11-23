@@ -14,7 +14,7 @@ from typing import Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
-from fastapi.responses import HTMLResponse, Response, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
@@ -30,7 +30,13 @@ from app.cv.video_processor import (
 )
 from app.db.database import get_db
 from app.db.models import AuditEvent, Case, Clip, CrossCameraEntity, RegistryVehicle, TrackedVehicle
-from app.engine.confusion_matrices import BODY_TYPES, COLOURS, PLATE_FORMAT_OPTIONS, normalise_body
+from app.engine.confusion_matrices import (
+    BODY_TYPES,
+    COLOURS,
+    PLATE_FORMAT_NAMES,
+    PLATE_FORMAT_OPTIONS,
+    normalise_body,
+)
 from app.engine.matcher import match
 from app.engine.schemas import (
     CharCandidate,
@@ -41,13 +47,17 @@ from app.engine.schemas import (
     RegistryRecord,
     SlotEvidence,
 )
+from app.api.labels import OUTCOME_LABELS
 from app.reports.generator import render_html, render_pdf
+from app.services.case_summary import build_preflight, readability, registry_snapshot, summarise
 from app.services.pipeline_orchestrator import (
     invalidate_registry,
     is_running,
     load_registry,
     models,
     progress_bus,
+    request_cancel,
+    rescore_case,
     submit_case,
 )
 
@@ -76,10 +86,6 @@ def clip_dict(clip: Clip) -> dict:
     }
 
 
-def _readability(known: int) -> str:
-    return "none" if known == 0 else "partial" if known < 5 else "comparable"
-
-
 def vehicle_summary(vehicle: TrackedVehicle) -> dict:
     result = vehicle.match_result or {}
     lead = (result.get("candidates") or [None])[0]
@@ -98,7 +104,9 @@ def vehicle_summary(vehicle: TrackedVehicle) -> dict:
         "link_status": vehicle.entity.review_status if vehicle.entity else None,
         "plate_script": vehicle.clip.plate_script,
         "plate_format": vehicle.clip.plate_format,
-        "readability": _readability(result.get("known_chars", 0)),
+        "readability": readability(result.get("known_chars", 0)),
+        "registry_coverage": result.get("registry_coverage"),
+        "track_quality": (vehicle.attributes or {}).get("track_quality"),
     }
 
 
@@ -116,31 +124,26 @@ def audit_dict(event: AuditEvent) -> dict:
             "created_at": _iso(event.created_at)}
 
 
-def case_summary(case: Case) -> dict:
-    outcomes = Counter((v.match_result or {}).get("outcome", "UNREADABLE_PLATE") for v in case.vehicles)
-    links = Counter(e.review_status for e in case.entities)
-    return {
-        "tracks": len(case.vehicles),
-        "plate_candidates": outcomes["PLATE_CANDIDATE"], "ambiguous": outcomes["AMBIGUOUS"],
-        "no_registry_match": outcomes["NO_REGISTRY_MATCH"], "insufficient_plate": outcomes["INSUFFICIENT_PLATE"],
-        "unreadable_plate": outcomes["UNREADABLE_PLATE"],
-        "possible_links": links["proposed"], "confirmed_links": links["confirmed"], "rejected_links": links["rejected"],
-        "fragments_merged": sum((c.processing or {}).get("fragments_merged", 0) for c in case.clips),
-        "clips_missing_time": sum(c.recorded_at is None for c in case.clips),
-    }
+def case_summary(session: Session, case: Case) -> dict:
+    return summarise(case.display_vehicles, case.display_entities, case.clips, load_registry(session), case.runtime)
 
 
-def case_dict(case: Case, detail: bool = False) -> dict:
+def case_dict(case: Case, detail: bool = False, session: Session | None = None) -> dict:
+    vehicles = case.display_vehicles
     payload = {
         "id": case.id, "title": case.title, "description": case.description, "status": case.status,
         "error": case.error, "pipeline_version": case.pipeline_version, "created_at": _iso(case.created_at),
-        "updated_at": _iso(case.updated_at), "clip_count": len(case.clips), "vehicle_count": len(case.vehicles),
+        "updated_at": _iso(case.updated_at), "clip_count": len(case.clips), "vehicle_count": len(vehicles),
         "running": is_running(case.id),
-        "stale": bool(case.vehicles) and case.pipeline_version != PIPELINE_VERSION,
+        "stale": bool(case.completed_vehicles) and case.pipeline_version != PIPELINE_VERSION,
+        "has_completed_run": bool(case.completed_vehicles) or (case.status == "COMPLETED"),
+        "showing_live_run": bool(case.live_run_id),
     }
     if detail:
-        payload.update(runtime=case.runtime, summary=case_summary(case), clips=[clip_dict(c) for c in case.clips],
-                       entities=[entity_dict(e) for e in case.entities],
+        payload.update(runtime=case.runtime, summary=case_summary(session, case),
+                       preflight=build_preflight(case, load_registry(session)),
+                       clips=[clip_dict(c) for c in case.clips],
+                       entities=[entity_dict(e) for e in case.display_entities],
                        audit=[audit_dict(e) for e in case.audit_events])
     return payload
 
@@ -182,7 +185,7 @@ def create_case(body: CaseCreate, session: Session = Depends(get_db)) -> dict:
     session.flush()
     session.add(AuditEvent(case_id=case.id, actor="system", action="CASE_CREATED", note=case.title))
     session.commit()
-    return case_dict(case, detail=True)
+    return case_dict(case, detail=True, session=session)
 
 
 @router.get("/cases")
@@ -192,7 +195,7 @@ def list_cases(session: Session = Depends(get_db)) -> list[dict]:
 
 @router.get("/cases/{case_id}")
 def get_case(case_id: str, session: Session = Depends(get_db)) -> dict:
-    return case_dict(_case_or_404(session, case_id), detail=True)
+    return case_dict(_case_or_404(session, case_id), detail=True, session=session)
 
 
 def _zone(value: str | None) -> str | None:
@@ -374,8 +377,17 @@ def update_clip(case_id: str, clip_id: str, body: ClipUpdate, session: Session =
     return clip_dict(clip)
 
 
+class AnalyzeRequest(BaseModel):
+    acknowledge_no_coverage: bool = False
+
+
+@router.get("/cases/{case_id}/preflight")
+def case_preflight(case_id: str, session: Session = Depends(get_db)) -> dict:
+    return build_preflight(_case_or_404(session, case_id), load_registry(session))
+
+
 @router.post("/cases/{case_id}/analyze", status_code=202)
-def analyze_case(case_id: str, session: Session = Depends(get_db)) -> dict:
+def analyze_case(case_id: str, body: AnalyzeRequest | None = None, session: Session = Depends(get_db)) -> dict:
     case = _case_or_404(session, case_id)
     if not case.clips:
         raise HTTPException(422, "Upload at least one clip first")
@@ -383,11 +395,45 @@ def analyze_case(case_id: str, session: Session = Depends(get_db)) -> dict:
     if not assets["ready"]:
         raise HTTPException(503, f"Missing {', '.join(assets['missing'])}. From the backend folder, run: "
                                  f"{assets['install_command']}")
+    preflight = build_preflight(case, load_registry(session))
+    if preflight["requires_acknowledgement"] and not (body and body.acknowledge_no_coverage):
+        raise HTTPException(409, {"code": "NO_REGISTRY_COVERAGE",
+                                  "message": "The active registry has no records for this camera's plate format.",
+                                  "preflight": preflight})
+    if preflight["requires_acknowledgement"]:
+        cameras = ", ".join(row["camera_label"] for row in preflight["coverage"] if row["status"] == "no_coverage")
+        session.add(AuditEvent(case_id=case.id, actor="Investigator", action="NO_COVERAGE_ACKNOWLEDGED", field=cameras,
+                               note="Analysis started for OCR evidence without a compatible registry."))
     if not submit_case(case_id):
         raise HTTPException(409, "Analysis is already running")
     case.status = "QUEUED"
     session.commit()
     return {"case_id": case_id, "status": "QUEUED"}
+
+
+@router.post("/cases/{case_id}/cancel", status_code=202)
+def cancel_case(case_id: str, session: Session = Depends(get_db)) -> dict:
+    _case_or_404(session, case_id)
+    if not request_cancel(case_id):
+        raise HTTPException(409, "No analysis is running for this case")
+    return {"case_id": case_id, "status": "CANCELLING"}
+
+
+@router.post("/cases/{case_id}/rescore")
+def rescore(case_id: str, session: Session = Depends(get_db)) -> dict:
+    """Re-run registry matching on stored OCR evidence after the registry or plate format changes."""
+    case = _case_or_404(session, case_id)
+    if is_running(case_id):
+        raise HTTPException(409, "Analysis is running")
+    if not case.completed_vehicles:
+        raise HTTPException(422, "Run analysis before re-matching")
+    for vehicle in case.completed_vehicles:
+        stored = (vehicle.ai_evidence or {}).get("plate_format", "latin_any")
+        if (stored == "non_latin_digits") != (vehicle.clip.plate_format == "non_latin_digits"):
+            raise HTTPException(409, f"{vehicle.clip.camera_label} changed to or from digits-only reading. "
+                                     "Re-run analysis so its OCR evidence is rebuilt.")
+    result = rescore_case(session, case)
+    return {**result, "summary": case_summary(session, case)}
 
 
 @router.get("/cases/{case_id}/progress")
@@ -401,8 +447,9 @@ async def case_progress(case_id: str, session: Session = Depends(get_db)) -> Str
 @router.get("/cases/{case_id}/vehicles")
 def list_vehicles(case_id: str, session: Session = Depends(get_db)) -> dict:
     case = _case_or_404(session, case_id)
-    ordered = sorted(case.vehicles, key=lambda v: (v.clip.camera_label, v.first_seen_sec))
-    return {"vehicles": [vehicle_summary(v) for v in ordered], "entities": [entity_dict(e) for e in case.entities]}
+    ordered = sorted(case.display_vehicles, key=lambda v: (v.clip.camera_label, v.first_seen_sec))
+    return {"vehicles": [vehicle_summary(v) for v in ordered],
+            "entities": [entity_dict(e) for e in case.display_entities]}
 
 
 def vehicle_detail(vehicle: TrackedVehicle) -> dict:
@@ -539,10 +586,99 @@ def report_pdf(case_id: str, appendix: bool = False, clip_id: str | None = None,
     })
 
 
+EXPORT_FIELDS = [
+    "case_id", "clip_id", "camera", "clip_sha256", "plate_format", "track_id", "first_seen_sec", "last_seen_sec",
+    "duration_sec", "sampled_frames", "track_quality", "quality_reasons", "plate_read", "known_characters",
+    "readability", "outcome", "outcome_label", "reason_codes", "registry_searched", "compatible_records",
+    "top_registry_plate", "match_score_uncalibrated", "registry_record_source", "link_status", "best_plate_crop_sha256",
+]
+
+
+def _spreadsheet_safe(value):
+    """Stop user-supplied text from being executed as a spreadsheet formula."""
+    if isinstance(value, str) and value[:1] in ("=", "+", "-", "@", "\t", "\r"):
+        return "'" + value
+    return value
+
+
+def _export_rows(case: Case, clip_id: str | None) -> list[dict]:
+    rows = []
+    vehicles = [v for v in case.completed_vehicles if clip_id is None or v.clip_id == clip_id]
+    for vehicle in sorted(vehicles, key=lambda v: (v.clip.camera_label, v.first_seen_sec, v.track_id)):
+        result = vehicle.match_result or {}
+        coverage = result.get("registry_coverage") or {}
+        lead = (result.get("candidates") or [None])[0]
+        quality = (vehicle.attributes or {}).get("track_quality") or {}
+        hashes = [frame.get("crop_sha256") for frame in vehicle.keyframes or [] if frame.get("crop_sha256")]
+        rows.append({
+            "case_id": case.id, "clip_id": vehicle.clip_id, "camera": vehicle.clip.camera_label,
+            "clip_sha256": vehicle.clip.sha256, "plate_format": vehicle.clip.plate_format, "track_id": vehicle.track_id,
+            "first_seen_sec": vehicle.first_seen_sec, "last_seen_sec": vehicle.last_seen_sec,
+            "duration_sec": round(vehicle.last_seen_sec - vehicle.first_seen_sec, 2),
+            "sampled_frames": vehicle.frames_tracked, "track_quality": quality.get("tier", "not_assessed"),
+            "quality_reasons": "; ".join(quality.get("reasons", [])), "plate_read": result.get("query_plate", ""),
+            "known_characters": result.get("known_chars", 0), "readability": readability(result.get("known_chars", 0)),
+            "outcome": result.get("outcome"), "outcome_label": OUTCOME_LABELS.get(result.get("outcome", ""), ""),
+            "reason_codes": ";".join(result.get("reason_codes", [])), "registry_searched": coverage.get("searched"),
+            "compatible_records": coverage.get("compatible_records"),
+            "top_registry_plate": lead["vehicle"]["plate"] if lead else "",
+            "match_score_uncalibrated": lead["score"] if lead else "",
+            "registry_record_source": lead["vehicle"].get("source", "") if lead else "",
+            "link_status": vehicle.entity.review_status if vehicle.entity else "",
+            "best_plate_crop_sha256": hashes[0] if hashes else "",
+        })
+    return rows
+
+
+@router.get("/cases/{case_id}/export.csv")
+def export_csv(case_id: str, clip_id: str | None = None, session: Session = Depends(get_db)) -> Response:
+    _report_scope(session, case_id, clip_id)
+    buffer = io.StringIO()
+    writer = csv.DictWriter(buffer, fieldnames=EXPORT_FIELDS)
+    writer.writeheader()
+    for row in _export_rows(session.get(Case, case_id), clip_id):
+        writer.writerow({key: _spreadsheet_safe(value) for key, value in row.items()})
+    return Response(buffer.getvalue(), media_type="text/csv", headers={
+        "Content-Disposition": f'attachment; filename="vitra_{case_id}.csv"'})
+
+
+@router.get("/cases/{case_id}/export.json")
+def export_json(case_id: str, clip_id: str | None = None, session: Session = Depends(get_db)) -> JSONResponse:
+    _report_scope(session, case_id, clip_id)
+    case = session.get(Case, case_id)
+    clips = [c for c in case.clips if clip_id is None or c.id == clip_id]
+    vehicles = [v for v in case.completed_vehicles if clip_id is None or v.clip_id == clip_id]
+    entities = [e for e in case.completed_entities
+                if clip_id is None or any(stop["clip_id"] == clip_id for stop in e.timeline)]
+    fused = {(v.clip_id, v.track_id): v.fused_plate for v in vehicles}
+    tracks = [{**row, "characters": [
+        {"position": s["position"], "char": s["char"], "confidence": s["confidence"],
+         "alternatives": s.get("candidates", []), "unknown_reason": s.get("unknown_reason")}
+        for s in fused[(row["clip_id"], row["track_id"])].get("slots", [])
+    ], "rejected_reads": fused[(row["clip_id"], row["track_id"])].get("rejected_reads", [])}
+        for row in _export_rows(case, clip_id)]
+    payload = {
+        "case": {"id": case.id, "title": case.title, "status": case.status, "pipeline_version": case.pipeline_version},
+        "summary": summarise(vehicles, entities, clips, load_registry(session), case.runtime),
+        "clips": [clip_dict(c) for c in clips], "tracks": tracks, "audit": [audit_dict(e) for e in case.audit_events],
+    }
+    return JSONResponse(payload, headers={
+        "Content-Disposition": f'attachment; filename="vitra_{case_id}.json"'})
+
+
 def registry_dict(row: RegistryVehicle) -> dict:
     return {"id": row.id, "plate": row.plate, "make": row.make, "model": row.model, "body_type": row.body_type,
             "colour": row.colour, "year": row.year, "owner_name": row.owner_name, "owner_city": row.owner_city,
             "status": row.status, "source": row.source}
+
+
+@router.get("/registry/coverage")
+def registry_coverage(session: Session = Depends(get_db)) -> dict:
+    index = load_registry(session)
+    return {**registry_snapshot(index), "formats": [
+        {"plate_format": key, "label": PLATE_FORMAT_NAMES[key], "compatible_records": index.compatible_count(key)}
+        for key in PLATE_FORMAT_OPTIONS
+    ]}
 
 
 @router.get("/registry")
@@ -655,7 +791,7 @@ def upload_registry(
     invalidate_registry()
     total = session.scalar(select(func.count()).select_from(RegistryVehicle))
     return {"inserted": inserted, "updated": updated, "rejected": len(rows) - len(valid), "errors": errors[:20],
-            "total": total}
+            "total": total, "coverage": registry_snapshot(load_registry(session))["by_family"]}
 
 
 class MatchTest(BaseModel):

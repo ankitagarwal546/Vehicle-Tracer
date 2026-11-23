@@ -21,3 +21,4 @@ pytest>=8.3
 httpx>=0.27
 lap>=0.5.12
 tzdata>=2024.1
+pypdf>=5

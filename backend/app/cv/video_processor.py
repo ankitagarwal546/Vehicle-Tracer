@@ -18,6 +18,7 @@ SEQUENCE_FPS = 5.0
 MAX_SEQUENCE_IMAGES = 2000
 STATIC_DIFF = 0.6
 MAX_STATIC_GAP_SEC = 2.0
+MAX_WINDOW_CANDIDATES = 3
 
 
 @dataclass
@@ -122,7 +123,8 @@ def probe_video(path: Path) -> VideoMetadata:
     return VideoMetadata(round(fps, 3), width, height, max(frames, 0), round(max(frames, 0) / fps, 3), codec or "unknown")
 
 
-def _raw_frames(path: Path, metadata: VideoMetadata) -> Iterator[tuple[int, np.ndarray]]:
+def _raw_frames(path: Path, metadata: VideoMetadata, stride: int = 1) -> Iterator[tuple[int, np.ndarray]]:
+    """Yield decoded frames. Frames between strides are grabbed but not colour-converted."""
     if path.is_dir():
         for index, image_path in enumerate(_sequence_images(path)):
             image = cv2.imread(str(image_path))
@@ -133,10 +135,12 @@ def _raw_frames(path: Path, metadata: VideoMetadata) -> Iterator[tuple[int, np.n
     try:
         index = 0
         while True:
-            ok, frame = capture.read()
-            if not ok:
+            if not capture.grab():
                 return
-            yield index, frame
+            if index % stride == 0:
+                ok, frame = capture.retrieve()
+                if ok:
+                    yield index, frame
             index += 1
     finally:
         capture.release()
@@ -184,15 +188,21 @@ def sample_frames(
         stats.kept += 1
         return SampledFrame(frame_idx, timestamp, image, sharp, brightness, contrast, low_sharpness)
 
-    for index, frame in _raw_frames(path, metadata):
-        sharp = sharpness_score(cv2.resize(frame, (320, int(320 * frame.shape[0] / frame.shape[1]))))
-        if best is None or sharp > best[0]:
-            best = (sharp, index, frame)
-        if (index + 1) % window == 0:
+    # Compare at most three evenly spaced candidates per window, and always cover the whole clip.
+    stride = max(window // MAX_WINDOW_CANDIDATES, 1)
+    current_window = 0
+    for index, frame in _raw_frames(path, metadata, stride):
+        window_index = index // window
+        if window_index != current_window and best is not None:
             result = evaluate(best)
             best = None
             if result is not None:
                 yield result
+        current_window = window_index
+        small = cv2.resize(frame, (320, int(320 * frame.shape[0] / frame.shape[1])), interpolation=cv2.INTER_AREA)
+        sharp = sharpness_score(small)
+        if best is None or sharp > best[0]:
+            best = (sharp, index, frame)
     if best is not None:
         result = evaluate(best)
         if result is not None:

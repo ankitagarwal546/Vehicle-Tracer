@@ -189,7 +189,8 @@ def test_format_mismatch_is_an_explicit_no_match(registry):
     evidence = query("QA15ZZK", colour="grey", body="hatchback")
     evidence.plate_format = "uk"
     result = match(evidence, registry)
-    assert result.outcome == "NO_REGISTRY_MATCH" and result.reason_codes == ["FORMAT_NOT_IN_REGISTRY"]
+    assert result.outcome == "NO_REGISTRY_COVERAGE" and result.reason_codes == ["NO_REGISTRY_COVERAGE"]
+    assert result.registry_coverage.compatible_records == 0 and result.registry_coverage.searched is False
     assert result.candidates == [] and result.rejected_candidates == []
 
 

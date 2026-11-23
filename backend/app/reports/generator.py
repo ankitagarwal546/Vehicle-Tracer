@@ -14,7 +14,9 @@ from sqlalchemy.orm import Session
 
 from app.api.labels import ENTITY_STATUS_LABELS, EVIDENCE_TIER_LABELS, OUTCOME_LABELS, PLATE_FORMAT_LABELS, pretty
 from app.config import settings
-from app.db.models import Case, RegistryVehicle
+from app.db.models import Case
+from app.services.case_summary import headline, readability, summarise
+from app.services.pipeline_orchestrator import load_registry
 
 logger = logging.getLogger(__name__)
 _environment = Environment(
@@ -26,6 +28,8 @@ MAX_CROP_WIDTH = 420
 MAX_KEY_VEHICLES = 8
 MAX_NO_MATCH_ROWS = 8
 MAX_AUDIT_ROWS = 8
+MAX_OCR_EXAMPLES = 4
+MAX_COVERAGE_ROWS = 12
 OUTCOME_ORDER = {"PLATE_CANDIDATE": 0, "AMBIGUOUS": 1}
 
 
@@ -66,7 +70,7 @@ def _attribute_line(attributes: dict) -> str:
 
 def build_context(session: Session, case: Case, appendix: bool, clip_id: str | None = None) -> dict:
     scoped_clips = [c for c in case.clips if clip_id is None or c.id == clip_id]
-    scoped_vehicles = [v for v in case.vehicles if clip_id is None or v.clip_id == clip_id]
+    scoped_vehicles = [v for v in case.completed_vehicles if clip_id is None or v.clip_id == clip_id]
     clips = [{
         "camera_label": c.camera_label, "location": c.location, "filename": c.filename, "sha256": c.sha256,
         "ingested_at": _iso(c.ingested_at), "recorded_at": _iso(c.recorded_at), "width": c.width, "height": c.height,
@@ -87,13 +91,23 @@ def build_context(session: Session, case: Case, appendix: bool, clip_id: str | N
             "outcome_label": OUTCOME_LABELS.get(result.get("outcome", ""), "Not analysed"),
             "attr_line": _attribute_line(vehicle.attributes or {}),
             "provenance": _provenance(vehicle.keyframes[0]) if vehicle.keyframes else "No keyframe stored.",
+            "readability": readability(result.get("known_chars", 0)),
+            "quality": (vehicle.attributes or {}).get("track_quality") or {},
+            "image_warnings": (vehicle.keyframes[0].get("image_warnings") or []) if vehicle.keyframes else [],
+            "rejected_reads": (vehicle.fused_plate or {}).get("rejected_reads") or [],
         })
     ranked = sorted((v for v in vehicles if v["outcome"] in OUTCOME_ORDER),
                     key=lambda v: (OUTCOME_ORDER[v["outcome"]],
                                    -((v["match"].get("candidates") or v["match"].get("rejected_candidates")
                                       or [{"score": 0}])[0]["score"])))
     key_vehicles = ranked[:MAX_KEY_VEHICLES]
-    for vehicle in key_vehicles:
+    evidence_only = sorted(
+        (v for v in vehicles if v["outcome"] in {"NO_REGISTRY_COVERAGE", "NO_REGISTRY_MATCH", "INSUFFICIENT_PLATE"}
+         and v["keyframes"] and v["keyframes"][0].get("plate_raw")),
+        key=lambda v: (-(v["match"].get("known_chars", 0)), -(v["keyframes"][0].get("plate_quality") or 0)),
+    )
+    ocr_examples = evidence_only[:MAX_OCR_EXAMPLES]
+    for vehicle in [*key_vehicles, *ocr_examples]:
         vehicle["keyframes"] = [
             {**frame, "crop_uri": _data_uri(frame.get("crop"), MAX_CROP_WIDTH),
              "frame_uri": _data_uri(frame.get("frame"), MAX_CROP_WIDTH),
@@ -106,7 +120,7 @@ def build_context(session: Session, case: Case, appendix: bool, clip_id: str | N
         "match_result": e.match_result, "review_status": e.review_status,
         "status_label": ENTITY_STATUS_LABELS.get(e.review_status, e.review_status),
         "tier_label": EVIDENCE_TIER_LABELS.get(e.evidence_tier, e.evidence_tier),
-    } for e in sorted(case.entities, key=lambda item: {"confirmed": 0, "proposed": 1}.get(item.review_status, 2))
+    } for e in sorted(case.completed_entities, key=lambda item: {"confirmed": 0, "proposed": 1}.get(item.review_status, 2))
         if e.review_status != "rejected" and (clip_id is None or any(t["clip_id"] == clip_id for t in e.timeline))]
     audit = [{"created_at": _iso(e.created_at), "actor": e.actor, "action": e.action, "vehicle_id": e.vehicle_id,
               "field": e.field, "ai_extracted": e.ai_extracted, "investigator_verified": e.investigator_verified,
@@ -119,29 +133,11 @@ def build_context(session: Session, case: Case, appendix: bool, clip_id: str | N
             for slot in vehicle["fused_plate"].get("slots", []) if slot.get("char") == "?" and slot.get("unknown_reason")
         ]
     no_match_vehicles = [v for v in vehicles if v["outcome"] == "NO_REGISTRY_MATCH"]
-    outcomes = [v["outcome"] for v in vehicles]
-    reviews = [e["review_status"] for e in entities]
-    summary = {
-        "tracks": len(vehicles),
-        "plate_candidates": outcomes.count("PLATE_CANDIDATE"), "ambiguous": outcomes.count("AMBIGUOUS"),
-        "no_registry_match": outcomes.count("NO_REGISTRY_MATCH"),
-        "insufficient_plate": outcomes.count("INSUFFICIENT_PLATE"),
-        "unreadable_plate": outcomes.count("UNREADABLE_PLATE"),
-        "possible_links": reviews.count("proposed"), "confirmed_links": reviews.count("confirmed"),
-    }
-    readable = summary["plate_candidates"] + summary["ambiguous"] + summary["no_registry_match"]
-    unusable = summary["insufficient_plate"] + summary["unreadable_plate"]
-    headline = (f"{readable} had enough plate characters to compare with the registry, and "
-                f"{summary['no_registry_match']} of those matched no registry vehicle. "
-                f"{unusable} had too few readable characters to compare.")
-    synthetic = session.query(RegistryVehicle).filter(RegistryVehicle.source == "synthetic").count()
-    total = session.query(RegistryVehicle).count()
-    if synthetic == total:
-        registry_note = f"The {total:,}-vehicle registry is entirely synthetic test data."
-    elif synthetic:
-        registry_note = f"{synthetic:,} of {total:,} registry vehicles are synthetic test data."
-    else:
-        registry_note = f"The registry contains {total:,} operator-supplied vehicles."
+    no_coverage_vehicles = [v for v in vehicles if v["outcome"] == "NO_REGISTRY_COVERAGE"]
+    scoped_entities = [e for e in case.completed_entities
+                       if clip_id is None or any(t["clip_id"] == clip_id for t in e.timeline)]
+    summary = summarise(scoped_vehicles, scoped_entities, scoped_clips, load_registry(session), case.runtime)
+    registry_note = summary["registry"]["note"]
     return {
         "case": case, "clips": clips, "vehicles": vehicles, "key_vehicles": key_vehicles,
         "hidden_key": max(len(ranked) - MAX_KEY_VEHICLES, 0), "entities": entities, "audit": audit,
@@ -149,7 +145,10 @@ def build_context(session: Session, case: Case, appendix: bool, clip_id: str | N
         "no_match_rows": no_match_vehicles[:MAX_NO_MATCH_ROWS],
         "hidden_no_match": max(len(no_match_vehicles) - MAX_NO_MATCH_ROWS, 0),
         "audit_recent": audit[-MAX_AUDIT_ROWS:],
-        "summary": summary, "headline": headline, "registry_note": registry_note,
+        "summary": summary, "headline": headline(summary), "registry_note": registry_note,
+        "ocr_examples": ocr_examples, "no_coverage_rows": no_coverage_vehicles[:MAX_COVERAGE_ROWS],
+        "hidden_no_coverage": max(len(no_coverage_vehicles) - MAX_COVERAGE_ROWS, 0),
+        "rejected_read_vehicles": [v for v in vehicles if v["rejected_reads"]],
         "missing_time": sum(c.recorded_at is None for c in scoped_clips),
         "scope_label": scoped_clips[0].camera_label if clip_id and scoped_clips else None,
         "has_synthetic_clip": any(c["synthetic"] for c in clips),
@@ -184,7 +183,9 @@ def _provenance(frame: dict) -> str:
         return "No plate crop was recovered for this track."
     size = frame.get("plate_crop_size") or ["?", "?"]
     rectification = (frame.get("rectification") or {}).get("reason", "not recorded")
-    return (f"Frame {frame['frame_idx']} at {frame['timestamp_sec']} s, sharpness {frame.get('frame_sharpness', 0)}, "
+    box = frame.get("plate_box_source")
+    location = f", source box {box}" if box else ""
+    return (f"Frame {frame['frame_idx']} at {frame['timestamp_sec']} s{location}, sharpness {frame.get('frame_sharpness', 0)}, "
             f"brightness {frame.get('brightness', 0)}, plate box {frame.get('plate_box_confidence', 0):.2f}, "
             f"crop {size[0]}x{size[1]} px, {frame.get('ocr_engine', 'OCR')}. Perspective: {rectification}.")
 
@@ -222,13 +223,16 @@ def _reportlab_pdf(context: dict) -> bytes:
         return Table(rows, colWidths=widths, style=grid, repeatRows=1)
 
     case, summary = context["case"], context["summary"]
-    tone = "#065F46" if summary["plate_candidates"] else "#92400E" if summary["ambiguous"] else "#9F1239"
+    tone = "#065F46" if summary["plate_candidates"] else "#92400E" if summary["ambiguous"] \
+        or summary["no_registry_coverage"] else "#9F1239"
     verdict = f"{summary['plate_candidates']} plate-supported candidate(s)" if summary["plate_candidates"] else \
-        f"No single match, {summary['ambiguous']} ambiguous" if summary["ambiguous"] else "No confident match"
+        f"No single match, {summary['ambiguous']} ambiguous" if summary["ambiguous"] else \
+        "No registry coverage: plates were read but not searched" if summary["no_registry_coverage"] else \
+        "No confident match"
     verdict_style = ParagraphStyle("verdict", parent=body, fontSize=12, leading=15, textColor=colors.HexColor(tone),
                                    fontName="Helvetica-Bold")
     story = [
-        Paragraph("Vehicle Identification Forensic Report", styles["Title"]),
+        Paragraph("VITRA Vehicle Identification Forensic Report", styles["Title"]),
         *([p("SYNTHETIC TEST FIXTURE: clips, plates, vehicles and owners are fictional.", verdict_style)]
           if context["has_synthetic_clip"] else []),
         *([p(f"Clip report: {context['scope_label']}", body)] if context["scope_label"] else []),
@@ -238,17 +242,35 @@ def _reportlab_pdf(context: dict) -> bytes:
         p(f"{summary['tracks']} vehicle track(s) across {len(context['clips'])} clip(s). {context['headline']}"),
     ]
     labels = [("Vehicle tracks", "tracks"), ("Candidates", "plate_candidates"), ("Ambiguous", "ambiguous"),
-              ("No match", "no_registry_match"), ("Partial plate", "insufficient_plate"),
-              ("Unreadable", "unreadable_plate"), ("To review", "possible_links"),
-              ("Confirmed", "confirmed_links")]
+              ("No match", "no_registry_match"), ("No coverage", "no_registry_coverage"),
+              ("Partial plate", "insufficient_plate"), ("Unreadable", "unreadable_plate")]
     story.append(table([[p(label, small) for label, _ in labels], [p(summary[key], mono) for _, key in labels]],
                        [full_width / len(labels)] * len(labels)))
-    missing = f" {context['missing_time']} clip(s) have no capture time, so temporal checks were not validated." \
-        if context["missing_time"] else ""
+    read_labels = [("Readable plates", "readable_plates"), ("Partial plates", "partial_plates"),
+                   ("No characters", "no_plate_chars"), ("Reliable tracks", "tracks_reliable"),
+                   ("Tracks to review", "tracks_review"), ("Links to review", "possible_links"),
+                   ("Confirmed links", "confirmed_links")]
+    story += [Spacer(1, 3), table([[p(label, small) for label, _ in read_labels],
+                                   [p(summary[key], mono) for _, key in read_labels]],
+                                  [full_width / len(read_labels)] * len(read_labels))]
     story += [Spacer(1, 4), p("Results are investigative leads and do not establish identity. Unreadable characters "
-                              "remain ? and are never inferred. Match scores are uncalibrated ranking values, not "
-                              f"probabilities. {context['registry_note']}{missing}", small),
-              Paragraph("Evidence Integrity", heading)]
+                              f"remain ? and are never inferred. {summary['score_note']} {context['registry_note']}",
+                              small),
+              p(f"Temporal validation: {summary['temporal_note']}", small),
+              p(f"Cross-camera status: {summary['cross_camera_note']}", small),
+              Paragraph("Registry Coverage", heading)]
+    rows = [[p("Camera"), p("Plate format"), p("Compatible records"), p("Registry records"), p("Status")]]
+    rows += [[p(row["camera_label"]), p(row["format_label"]), p(row["compatible_records"], mono),
+              p(row["total_records"], mono), p("No coverage" if row["status"] == "no_coverage" else "Covered")]
+             for row in summary["coverage"]]
+    story.append(table(rows, [40 * mm, 45 * mm, 35 * mm, 32 * mm, 30 * mm]))
+    if summary["no_registry_coverage"]:
+        story.append(p(f"{summary['no_registry_coverage']} readable plate(s) were not searched. The registry has no "
+                       "compatible records for their format. They remain OCR evidence and are not no-match results.",
+                       body))
+    for hint in summary["format_hints"]:
+        story.append(p(hint["message"], body))
+    story.append(Paragraph("Evidence Integrity", heading))
     rows = [[p("Camera"), p("File"), p("SHA-256"), p("Capture (UTC)"), p("Technical")]]
     for clip in context["clips"]:
         camera = f"{clip['camera_label']} ({clip['plate_format']})"
@@ -291,8 +313,36 @@ def _reportlab_pdf(context: dict) -> bytes:
         story.append(p(f"{context['hidden_key']} further track(s) with registry candidates are listed in the appendix.",
                        small))
 
+    def evidence_block(vehicle: dict) -> None:
+        frame = vehicle["keyframes"][0] if vehicle["keyframes"] else {}
+        rows = [[p("Raw source crop", small), p("Enhanced for viewing (CLAHE)", small)],
+                [image(frame.get("raw_uri"), 70 * mm), image(frame.get("enhanced_uri"), 70 * mm)]]
+        block = [Paragraph(escape(f"{vehicle['camera_label']} - Track {vehicle['track_id']} - "
+                                  f"{vehicle['match'].get('query_plate') or 'plate not read'} - "
+                                  f"{vehicle['outcome_label']}"), sub),
+                 Table(rows, hAlign="LEFT"), p(_provenance(frame), small)]
+        block += [p(item, small) for item in vehicle["image_warnings"]]
+        block += [p(item, small) for item in vehicle["unknown_notes"]]
+        story.append(KeepTogether(block))
+
+    if context["ocr_examples"]:
+        story.append(Paragraph("OCR Evidence Examples", heading))
+        story.append(p("Enhanced views help review and do not add source detail.", small))
+        for vehicle in context["ocr_examples"]:
+            evidence_block(vehicle)
+
+    if context["no_coverage_rows"]:
+        story.append(Paragraph("Plates Not Searched: No Registry Coverage", heading))
+        rows = [[p("Camera"), p("Track"), p("OCR plate read"), p("Compatible records")]]
+        rows += [[p(v["camera_label"]), p(v["track_id"], mono), p(v["match"]["query_plate"], mono),
+                  p((v["match"].get("registry_coverage") or {}).get("compatible_records", 0), mono)]
+                 for v in context["no_coverage_rows"]]
+        story.append(table(rows, [45 * mm, 18 * mm, 60 * mm, 45 * mm]))
+        if context["hidden_no_coverage"]:
+            story.append(p(f"{context['hidden_no_coverage']} more are listed in the appendix.", small))
+
     if context["no_match_rows"]:
-        story.append(Paragraph("No-Match Outcomes", heading))
+        story.append(Paragraph("No-Match Outcomes (Compatible Registry Searched)", heading))
         rows = [[p("Camera"), p("Track"), p("Recovered plate"), p("Reason")]]
         rows += [[p(v["camera_label"]), p(v["track_id"], mono), p(v["match"]["query_plate"], mono),
                   p(v["match"]["diagnostics"][0] if v["match"]["diagnostics"] else "No registry match", small)]
@@ -302,6 +352,7 @@ def _reportlab_pdf(context: dict) -> bytes:
             story.append(p(f"{context['hidden_no_match']} more are listed in the appendix.", small))
 
     story.append(Paragraph("Cross-Camera Links", heading))
+    story.append(p(summary["cross_camera_note"], small))
     if context["entities"]:
         rows = [[p("Review status"), p("Evidence"), p("Sightings"), p("Plate if merged"), p("Temporal check")]]
         for entity in context["entities"]:
@@ -310,7 +361,7 @@ def _reportlab_pdf(context: dict) -> bytes:
                          p(entity["fused_plate"].get("text") or "unread", mono),
                          p("; ".join(link["temporal_note"] for link in entity["links"]), small)])
         story.append(table(rows, [24 * mm, 34 * mm, 48 * mm, 26 * mm, 50 * mm]))
-    else:
+    elif summary["cross_camera_status"] == "evaluated":
         story.append(p("No pair of tracks had enough independent evidence to propose a link."))
 
     story.append(Paragraph("Audit Log", heading))
@@ -341,6 +392,12 @@ def _reportlab_pdf(context: dict) -> bytes:
             rows += [[p("Fused")] + [p(s["char"], mono) for s in slots]]
             story.append(KeepTogether([p(f"{vehicle['camera_label']} - Track {vehicle['track_id']}", sub),
                                        table(rows, [18 * mm] + [10 * mm] * len(slots))]))
+        if context["rejected_read_vehicles"]:
+            story.append(Paragraph("Appendix: Rejected Reads", heading))
+            rows = [[p("Camera"), p("Track"), p("Frame"), p("Read"), p("Reason")]]
+            rows += [[p(v["camera_label"]), p(v["track_id"], mono), p(r["frame_idx"], mono), p(r["raw_text"], mono),
+                      p(r["reason"], small)] for v in context["rejected_read_vehicles"] for r in v["rejected_reads"]]
+            story.append(table(rows, [30 * mm, 14 * mm, 16 * mm, 34 * mm, 88 * mm]))
         story.append(Paragraph("Appendix: Audit Log", heading))
         rows = [[p("Time"), p("Actor"), p("Action"), p("Field"), p("Note")]]
         rows += [[p(e["created_at"], mono), p(e["actor"]), p(pretty(e["action"]).lower()), p(e["field"]), p(e["note"])]

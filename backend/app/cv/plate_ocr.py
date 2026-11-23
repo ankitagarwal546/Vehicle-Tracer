@@ -8,7 +8,10 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import re
+import threading
+from collections import OrderedDict
 from dataclasses import dataclass, field
 
 import cv2
@@ -18,12 +21,19 @@ from app.config import settings
 from app.cv.device import active_device
 from app.cv.model_assets import ModelsNotInstalled, asset_status
 from app.cv.plate_fusion import PlateRead, align
-from app.cv.plate_variants import VARIANTS, Rectification, build_variants
+from app.cv.plate_variants import CORE_VARIANTS, VARIANTS, Rectification, build_variants
 
 logger = logging.getLogger(__name__)
 
-MIN_DETECT_SIDE = 640
+DETECT_SIDE = 608
 MAX_DETECT_SCALE = 3.0
+PLATE_ROI_TOP = 0.25
+PLATE_PAD_X = 0.04
+PLATE_PAD_Y = 0.08
+LOW_RES_PLATE_WIDTH = 100
+LOW_RES_PLATE_HEIGHT = 32
+CORE_AGREEMENT_CONF = 0.9
+OCR_CACHE_SIZE = 2048
 MIN_PLATE_WIDTH = 28
 MIN_PLATE_HEIGHT = 11
 MIN_PLATE_ASPECT = 1.2
@@ -78,6 +88,12 @@ class PlateObservation:
     box_confidence: float
     quality: float
     rectification: Rectification
+    box_in_source: tuple[int, int, int, int] | None = None
+    variants_read: tuple[str, ...] = ()
+
+    @property
+    def image_warnings(self) -> list[str]:
+        return plate_image_warnings(self.raw_crop.shape[1], self.raw_crop.shape[0], self.quality)
 
 
 def trim_country_band(image: np.ndarray) -> np.ndarray:
@@ -103,6 +119,17 @@ def plate_quality(image: np.ndarray) -> float:
     if variance < 1.0:
         return 0.0
     return float(cv2.Laplacian(resized, cv2.CV_32F).var()) / variance
+
+
+def plate_image_warnings(width: int, height: int, quality: float) -> list[str]:
+    """Plain warnings so investigators can tell a clearer view from recoverable detail."""
+    warnings: list[str] = []
+    if width < LOW_RES_PLATE_WIDTH or height < LOW_RES_PLATE_HEIGHT:
+        warnings.append(f"Low source resolution ({width}×{height} px). Enhancement cannot restore detail "
+                        "that the camera did not capture.")
+    if quality < 0.05:
+        warnings.append("Source crop is soft or blurred. Enhanced views are for viewing only.")
+    return warnings
 
 
 def plate_belongs_to_target(
@@ -156,7 +183,8 @@ def combine_variants(outputs: dict[str, OcrOutput | None]) -> CombinedRead | Non
     """Compare one frame's variants per character, using the raw read as the coordinate frame.
 
     A character that the raw crop does not support is marked unsupported and its confidence is
-    halved. Fusion later keeps it only if another frame's source pixels support it.
+    halved. Fusion later keeps it only if another frame's source pixels support it. Derived views
+    can lower confidence by disagreeing, but they can never raise it above the raw crop's value.
     """
     available = {name: value for name, value in outputs.items() if value is not None and value.text}
     if not available:
@@ -193,8 +221,11 @@ def combine_variants(outputs: dict[str, OcrOutput | None]) -> CombinedRead | Non
         ranked = sorted(tally.items(), key=lambda item: (-item[1], item[0]))
         chosen, mass = ranked[0]
         confidence = mass / max(total_weight, 1e-9)
-        has_source = raw is not None and (raw.text[index] == chosen or raw.probability(index, chosen) >= MIN_RAW_SUPPORT)
-        if not has_source:
+        raw_probability = raw.probability(index, chosen) if raw is not None else 0.0
+        has_source = raw is not None and (raw.text[index] == chosen or raw_probability >= MIN_RAW_SUPPORT)
+        if has_source:
+            confidence = min(confidence, raw_probability)
+        else:
             confidence *= UNSUPPORTED_PENALTY
         text.append(chosen)
         confidences.append(float(min(confidence, 1.0)))
@@ -205,8 +236,16 @@ def combine_variants(outputs: dict[str, OcrOutput | None]) -> CombinedRead | Non
     return CombinedRead("".join(text), confidences, alternatives, supported, votes_by_slot)
 
 
+def analysis_worker_count() -> int:
+    """Bounded CPU parallelism: half the cores, at most four workers."""
+    if settings.analysis_workers > 0:
+        return settings.analysis_workers
+    return max(1, min(4, (os.cpu_count() or 2) // 2))
+
+
 class FastAlprEngine:
     name = "fast-alpr"
+    thread_safe = True
 
     def __init__(self) -> None:
         from fast_alpr import ALPR
@@ -215,14 +254,25 @@ class FastAlprEngine:
             raise ModelsNotInstalled("FastALPR weights are not installed. Run scripts/download_models.py.")
         providers = ["CUDAExecutionProvider", "CPUExecutionProvider"] if active_device() == "cuda" \
             else ["CPUExecutionProvider"]
+        import onnxruntime as ort
+
+        options = ort.SessionOptions()
+        options.intra_op_num_threads = max(1, (os.cpu_count() or 2) // analysis_worker_count())
+        ocr_options = ort.SessionOptions()
+        ocr_options.intra_op_num_threads = options.intra_op_num_threads
         self.alpr = ALPR(
             detector_model=settings.alpr_detector_model,
             detector_conf_thresh=settings.plate_detector_conf,
             detector_providers=providers,
+            detector_sess_options=options,
             ocr_model=settings.alpr_ocr_model,
             ocr_device="cuda" if active_device() == "cuda" else "cpu",
             ocr_providers=providers,
+            ocr_sess_options=ocr_options,
         )
+        recognizer = self.alpr.ocr.ocr_model
+        self._capture = _CapturingSession(recognizer.model)
+        recognizer.model = self._capture
 
     def locate(self, image: np.ndarray) -> list[tuple[tuple[int, int, int, int], float]]:
         """Return plate boxes with detector confidence, most confident first."""
@@ -236,15 +286,8 @@ class FastAlprEngine:
         names = list(images)
         convert = {"grayscale": cv2.COLOR_BGR2GRAY, "rgb": cv2.COLOR_BGR2RGB}.get(recognizer.config.image_color_mode)
         batch = [cv2.cvtColor(images[name], convert) if convert is not None else images[name] for name in names]
-        fetch = [recognizer.plate_output_name]
-        session = recognizer.model
-        capture = _CapturingSession(session)
-        recognizer.model = capture
-        try:
-            recognizer.run(batch, return_confidence=True)
-        finally:
-            recognizer.model = session
-        probabilities = capture.output(fetch[0])
+        recognizer.run(batch, return_confidence=True)
+        probabilities = self._capture.output(recognizer.plate_output_name)
         alphabet = recognizer.config.alphabet
         pad = recognizer.config.pad_char
         return {name: _decode_slots(probabilities[i], alphabet, pad) for i, name in enumerate(names)}
@@ -255,15 +298,15 @@ class _CapturingSession:
 
     def __init__(self, session) -> None:
         self._session = session
-        self._outputs: dict[str, np.ndarray] = {}
+        self._local = threading.local()
 
     def run(self, names, feed):
         values = self._session.run(names, feed)
-        self._outputs = dict(zip(names, values))
+        self._local.outputs = dict(zip(names, values))
         return values
 
     def output(self, name: str) -> np.ndarray:
-        return self._outputs[name]
+        return self._local.outputs[name]
 
     def __getattr__(self, name):
         return getattr(self._session, name)
@@ -295,6 +338,7 @@ class EasyOcrEngine:
     """Offline fallback. It reports one confidence per word, applied to each character."""
 
     name = "easyocr"
+    thread_safe = False
 
     def __init__(self) -> None:
         import easyocr
@@ -337,6 +381,9 @@ class PlateReader:
     def __init__(self) -> None:
         self.engine = None
         self.errors: dict[str, str] = {}
+        self._cache: OrderedDict[str, tuple[dict, CombinedRead | None]] = OrderedDict()
+        self._cache_lock = threading.Lock()
+        self.cache_hits = 0
         for factory in (FastAlprEngine, EasyOcrEngine):
             try:
                 self.engine = factory()
@@ -349,44 +396,86 @@ class PlateReader:
     def name(self) -> str:
         return self.engine.name if self.engine else "unavailable"
 
-    def read_vehicle(
+    @property
+    def workers(self) -> int:
+        return analysis_worker_count() if getattr(self.engine, "thread_safe", False) else 1
+
+    def _read_views(self, digest: str, views: dict[str, np.ndarray]) -> tuple[dict, CombinedRead | None]:
+        """OCR core views, then the rest only when core views disagree or are uncertain.
+
+        Results are cached by raw-crop hash, so identical source pixels are never read twice.
+        """
+        with self._cache_lock:
+            cached = self._cache.get(digest)
+            if cached is not None:
+                self._cache.move_to_end(digest)
+                self.cache_hits += 1
+                return cached
+        core = {name: views[name] for name in CORE_VARIANTS if name in views}
+        outputs = dict(self.engine.read_many(core))
+        texts = {output.text for output in outputs.values() if output is not None}
+        settled = len(texts) == 1 and all(
+            output is not None and min(output.confidences) >= CORE_AGREEMENT_CONF for output in outputs.values())
+        if not settled:
+            remaining = {name: image for name, image in views.items() if name not in outputs}
+            if remaining:
+                outputs.update(self.engine.read_many(remaining))
+        result = (outputs, combine_variants(outputs))
+        with self._cache_lock:
+            self._cache[digest] = result
+            while len(self._cache) > OCR_CACHE_SIZE:
+                self._cache.popitem(last=False)
+        return result
+
+    def inspect_vehicle(
         self,
         crop: np.ndarray,
         frame_idx: int,
         timestamp: float,
         target: tuple[int, int, int, int] | None = None,
         occluders: list[tuple[int, int, int, int]] | None = None,
-    ) -> PlateObservation | None:
-        """Read the plate that belongs to the target vehicle, ignoring plates of nearer vehicles."""
+        crop_origin: tuple[int, int] = (0, 0),
+    ) -> tuple[PlateObservation | None, str | None]:
+        """Read the target vehicle's plate from native-resolution pixels, or say why not."""
         if self.engine is None:
-            return None
+            return None, "no OCR engine"
         height, width = crop.shape[:2]
-        scale = min(MAX_DETECT_SCALE, max(MIN_DETECT_SIDE / max(height, width), 1.0))
-        scaled = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC) if scale > 1 else crop
+        tx1, ty1, tx2, ty2 = target or (0, 0, width, height)
+        # The plate is on the lower body, so only that region is sent to the fixed-size detector.
+        roi_top = max(int(ty1 + (ty2 - ty1) * PLATE_ROI_TOP), 0)
+        region = crop[roi_top:height, :]
+        scale = min(MAX_DETECT_SCALE, DETECT_SIDE / max(region.shape[:2]))
+        scaled = cv2.resize(region, None, fx=scale, fy=scale,
+                            interpolation=cv2.INTER_CUBIC if scale > 1 else cv2.INTER_AREA) if scale != 1 else region
         located = None
         box_confidence = 0.0
-        for candidate, confidence in self.engine.locate(scaled):
-            box = tuple(int(round(value / scale)) for value in candidate)
-            if plate_belongs_to_target(box, target or (0, 0, width, height), occluders or []):
+        candidates = self.engine.locate(scaled)
+        for candidate, confidence in candidates:
+            x1, y1, x2, y2 = (value / scale for value in candidate)
+            box = (int(round(x1)), int(round(y1 + roi_top)), int(round(x2)), int(round(y2 + roi_top)))
+            if plate_belongs_to_target(box, (tx1, ty1, tx2, ty2), occluders or []):
                 located, box_confidence = box, confidence
                 break
         if located is None:
-            return None
+            return None, "plate belonged to another vehicle" if candidates else "no plate detected"
         x1, y1, x2, y2 = located
-        x1, y1, x2, y2 = max(x1, 0), max(y1, 0), min(x2, width), min(y2, height)
+        pad_x, pad_y = max(2, round((x2 - x1) * PLATE_PAD_X)), max(1, round((y2 - y1) * PLATE_PAD_Y))
+        x1, y1, x2, y2 = max(x1 - pad_x, 0), max(y1 - pad_y, 0), min(x2 + pad_x, width), min(y2 + pad_y, height)
         plate_width, plate_height = x2 - x1, y2 - y1
-        if plate_width < MIN_PLATE_WIDTH or plate_height < MIN_PLATE_HEIGHT \
-                or plate_width / max(plate_height, 1) < MIN_PLATE_ASPECT:
-            return None
+        if plate_width < MIN_PLATE_WIDTH or plate_height < MIN_PLATE_HEIGHT:
+            return None, f"plate too small ({plate_width}×{plate_height} px)"
+        if plate_width / max(plate_height, 1) < MIN_PLATE_ASPECT:
+            return None, "plate box is not plate-shaped"
         raw = trim_country_band(crop[y1:y2, x1:x2].copy())
+        raw.setflags(write=False)
         quality = plate_quality(raw)
         if quality < MIN_PLATE_QUALITY:
-            return None
+            return None, "plate crop has no usable focus"
+        digest = hashlib.sha256(raw.tobytes()).hexdigest()
         variants, rectification = build_variants(raw)
-        outputs = self.engine.read_many(variants)
-        combined = combine_variants(outputs)
+        outputs, combined = self._read_views(digest, variants)
         if combined is None:
-            return None
+            return None, "OCR returned no characters"
         read = PlateRead(
             frame_idx=frame_idx, timestamp_sec=timestamp, raw_text=combined.text,
             char_confidences=combined.confidences, sharpness_score=quality,
@@ -394,9 +483,17 @@ class PlateReader:
             ocr_engine_score=float(np.mean(combined.confidences)),
             source=f"{self.engine.name}:multi-variant", char_alternatives=combined.alternatives,
             char_source_supported=combined.source_supported, char_variants=combined.variant_votes,
-            ocr_engine=self.engine.name, crop_sha256=hashlib.sha256(raw.tobytes()).hexdigest(),
+            ocr_engine=self.engine.name, crop_sha256=digest,
         )
-        return PlateObservation(read, raw, variants, outputs, (x1, y1, x2, y2), box_confidence, quality, rectification)
+        origin_x, origin_y = crop_origin
+        source_box = (x1 + origin_x, y1 + origin_y, x2 + origin_x, y2 + origin_y)
+        return PlateObservation(read, raw, variants, outputs, (x1, y1, x2, y2), box_confidence, quality, rectification,
+                                source_box, tuple(outputs)), None
+
+    def read_vehicle(self, crop: np.ndarray, frame_idx: int, timestamp: float,
+                     target: tuple[int, int, int, int] | None = None,
+                     occluders: list[tuple[int, int, int, int]] | None = None) -> PlateObservation | None:
+        return self.inspect_vehicle(crop, frame_idx, timestamp, target, occluders)[0]
 
     def read_stack(self, observations: list[PlateObservation]) -> tuple[PlateRead | None, np.ndarray | None]:
         """OCR a multi-frame stack. The read is flagged derived so it cannot count as extra frames."""
@@ -406,7 +503,7 @@ class PlateReader:
         if stacked is None:
             return None, None
         views, _ = build_variants(stacked)
-        combined = combine_variants(self.engine.read_many(views))
+        _, combined = self._read_views(hashlib.sha256(stacked.tobytes()).hexdigest(), views)
         if combined is None:
             return None, stacked
         when = float(np.mean([item.read.timestamp_sec for item in observations]))

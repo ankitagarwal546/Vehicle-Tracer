@@ -5,17 +5,19 @@ import asyncio
 import json
 import logging
 import os
+import shutil
 import threading
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
 from datetime import timedelta, timezone
 from pathlib import Path
 
 import cv2
 import numpy as np
-from sqlalchemy import delete, select
+from sqlalchemy import delete, or_, select
 from sqlalchemy.orm import Session
 
 from app.config import PIPELINE_VERSION, settings
@@ -24,23 +26,46 @@ from app.cv import make_model
 from app.cv.clip_service import ClipService
 from app.cv.detector_tracker import VehicleDetectorTracker, VehicleTrack, apply_stitching
 from app.cv.device import active_device
+from app.cv.frame_selection import reads_are_stable, select_plate_frames
 from app.cv.model_assets import INSTALL_COMMAND, ModelsNotInstalled, asset_status, require_analysis_models
 from app.cv.plate_fusion import FusedPlate, PlateRead, fuse_plate_reads
 from app.cv.plate_ocr import PlateObservation, PlateReader
 from app.cv.plate_variants import VARIANTS
 from app.cv.reid import TrackProfile, link_tracks, mean_embedding, spatial_hsv_histogram
+from app.cv.track_quality import assess_track
 from app.cv.track_stitcher import plan_merges
 from app.cv.video_processor import SamplingStats, probe_video, sample_frames, sha256_file
 from app.db.database import SessionLocal
 from app.db.models import AuditEvent, Case, Clip, CrossCameraEntity, RegistryVehicle, TrackedVehicle
 from app.engine.matcher import RegistryIndex, match
-from app.engine.schemas import LabelScore, MakeModelScore, PlateEvidence, QueryEvidence, RegistryRecord
+from app.engine.schemas import (
+    CharCandidate,
+    LabelScore,
+    MakeModelScore,
+    PlateEvidence,
+    QueryEvidence,
+    RegistryRecord,
+    SlotEvidence,
+)
 
 logger = logging.getLogger(__name__)
 KEYFRAMES_PER_TRACK = 5
 MAX_PLATE_MISSES = 6
 MIN_FRAMES_IF_TRUNCATED = 8
-TERMINAL = {"COMPLETED", "FAILED"}
+TERMINAL = {"COMPLETED", "FAILED", "CANCELLED"}
+EMBEDDING_BATCH = 32
+COMMIT_EVERY_TRACKS = 3
+ETA_MIN_PERCENT = 8.0
+STAGE_LABELS = {
+    "queued": "Queued", "models": "Loading models", "integrity": "Verifying evidence hashes",
+    "tracking": "Detecting and tracking vehicles", "stitching": "Merging track fragments",
+    "recognition": "Reading plates and attributes", "reid": "Comparing cameras",
+    "report": "Finalising results", "done": "Complete", "failed": "Failed", "cancelled": "Cancelled",
+}
+
+
+class AnalysisCancelled(Exception):
+    """Raised at a safe checkpoint after an investigator cancels a run."""
 
 
 class ProgressBus:
@@ -48,18 +73,26 @@ class ProgressBus:
 
     def __init__(self) -> None:
         self._events: dict[str, list[dict]] = {}
+        self._started: dict[str, float] = {}
         self._lock = threading.Lock()
 
     def reset(self, case_id: str) -> None:
         with self._lock:
             self._events[case_id] = []
+            self._started[case_id] = time.monotonic()
 
-    def publish(self, case_id: str, stage: str, percent: float, message: str, status: str = "RUNNING") -> None:
-        event = {"stage": stage, "percent": round(percent, 1), "message": message, "status": status,
-                 "ts": time.time()}
+    def publish(self, case_id: str, stage: str, percent: float, message: str, status: str = "RUNNING",
+                **extra) -> None:
         with self._lock:
             events = self._events.setdefault(case_id, [])
-            event["seq"] = len(events)
+            elapsed = time.monotonic() - self._started.setdefault(case_id, time.monotonic())
+            previous = events[-1]["percent"] if events else 0.0
+            # Progress never moves backwards, except that a terminal failure keeps its last value.
+            shown = max(percent, previous) if status == "RUNNING" else (100.0 if status == "COMPLETED" else previous)
+            eta = round(elapsed * (100 - shown) / shown, 1) if status == "RUNNING" and shown >= ETA_MIN_PERCENT else None
+            event = {"stage": stage, "stage_label": STAGE_LABELS.get(stage, stage), "percent": round(shown, 1),
+                     "message": message, "status": status, "ts": time.time(), "elapsed_sec": round(elapsed, 1),
+                     "eta_sec": eta, "seq": len(events), **extra}
             events.append(event)
 
     def since(self, case_id: str, cursor: int) -> list[dict]:
@@ -141,6 +174,7 @@ class ModelHub:
 models = ModelHub()
 _executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="pipeline")
 _active: set[str] = set()
+_cancel_flags: dict[str, threading.Event] = {}
 _active_lock = threading.Lock()
 
 
@@ -149,6 +183,7 @@ def submit_case(case_id: str) -> bool:
         if case_id in _active:
             return False
         _active.add(case_id)
+        _cancel_flags[case_id] = threading.Event()
     progress_bus.reset(case_id)
     progress_bus.publish(case_id, "queued", 0, "Queued for analysis")
     _executor.submit(_run_guarded, case_id)
@@ -160,21 +195,82 @@ def is_running(case_id: str) -> bool:
         return case_id in _active
 
 
+def request_cancel(case_id: str) -> bool:
+    with _active_lock:
+        flag = _cancel_flags.get(case_id)
+        if case_id not in _active or flag is None:
+            return False
+        flag.set()
+    progress_bus.publish(case_id, "cancelling", 0, "Cancelling at the next safe checkpoint")
+    return True
+
+
+def _checkpoint(case_id: str) -> None:
+    with _active_lock:
+        flag = _cancel_flags.get(case_id)
+    if flag is not None and flag.is_set():
+        raise AnalysisCancelled()
+
+
+def _abort_run(case_id: str, status: str, message: str) -> None:
+    """Remove the unfinished run and leave the previous completed results and evidence intact."""
+    with SessionLocal() as session:
+        case = session.get(Case, case_id)
+        if case is None:
+            return
+        partial = 0
+        run_id = None
+        if case.live_run_id:
+            partial = len([v for v in case.vehicles if v.run_id == case.live_run_id])
+            session.execute(delete(TrackedVehicle).where(TrackedVehicle.case_id == case_id,
+                                                         TrackedVehicle.run_id == case.live_run_id))
+            session.execute(delete(CrossCameraEntity).where(CrossCameraEntity.case_id == case_id,
+                                                            CrossCameraEntity.run_id == case.live_run_id))
+        run_id = case.live_run_id
+        case.live_run_id = None
+        case.status = status
+        case.error = message
+        session.add(AuditEvent(case_id=case_id, actor="system", action=f"ANALYSIS_{status}",
+                               note=f"{message} {partial} unfinished track(s) were discarded. "
+                                    "Original evidence and any previous completed results are unchanged."))
+        session.commit()
+    if run_id:
+        shutil.rmtree(settings.artifact_dir / case_id / run_id, ignore_errors=True)
+
+
 def _run_guarded(case_id: str) -> None:
     try:
+        _checkpoint(case_id)
         run_pipeline(case_id)
+    except AnalysisCancelled:
+        _abort_run(case_id, "CANCELLED", "Analysis was cancelled by the investigator.")
+        progress_bus.publish(case_id, "cancelled", 0, "Analysis cancelled. No partial results were kept.", "CANCELLED")
     except Exception as error:
         logger.exception("Pipeline failed for case %s", case_id)
-        with SessionLocal() as session:
-            case = session.get(Case, case_id)
-            if case:
-                case.status = "FAILED"
-                case.error = f"{type(error).__name__}: {error}"
-                session.commit()
-        progress_bus.publish(case_id, "failed", 100, f"Analysis failed: {error}", "FAILED")
+        message = f"{type(error).__name__}: {error}"
+        _abort_run(case_id, "FAILED", message)
+        progress_bus.publish(case_id, "failed", 0, f"Analysis failed: {error}", "FAILED")
     finally:
         with _active_lock:
             _active.discard(case_id)
+            _cancel_flags.pop(case_id, None)
+
+
+def recover_interrupted_runs(session: Session) -> int:
+    """After a restart, drop unfinished runs and keep any earlier completed results."""
+    cases = session.scalars(select(Case).where(Case.status.in_(["QUEUED", "RUNNING"]))).all()
+    for case in cases:
+        if case.live_run_id:
+            session.execute(delete(TrackedVehicle).where(TrackedVehicle.case_id == case.id,
+                                                         TrackedVehicle.run_id == case.live_run_id))
+            session.execute(delete(CrossCameraEntity).where(CrossCameraEntity.case_id == case.id,
+                                                            CrossCameraEntity.run_id == case.live_run_id))
+            shutil.rmtree(settings.artifact_dir / case.id / case.live_run_id, ignore_errors=True)
+        case.live_run_id = None
+        case.status = "FAILED"
+        case.error = "Interrupted by a server restart. Run the analysis again."
+    session.commit()
+    return len(cases)
 
 
 _registry_cache: RegistryIndex | None = None
@@ -227,6 +323,7 @@ class TrackAnalysis:
     histogram: np.ndarray
     crops: list[np.ndarray]
     stacked_plate: np.ndarray | None = None
+    plate_inspection: dict = field(default_factory=dict)
 
 
 def _write_image(path: Path, image: np.ndarray, quality: int = 90, read_only: bool = False) -> str:
@@ -248,17 +345,37 @@ def verify_clip_integrity(clip: Clip) -> None:
         raise ValueError(f"Evidence file for {clip.camera_label} no longer matches its ingest SHA-256")
 
 
-def _analyse_track(track: VehicleTrack, digits_only: bool = False, artifact_base: Path | None = None) -> TrackAnalysis:
+def _ensure_embeddings(observations: list) -> None:
+    """Encode each crop once, in batches. Stitching and attributes then share the result."""
+    if not models.clip.available:
+        return
+    missing = [item for item in observations if item.embedding is None]
+    for start in range(0, len(missing), EMBEDDING_BATCH):
+        batch = missing[start:start + EMBEDDING_BATCH]
+        for item, vector in zip(batch, models.clip.encode_images([entry.crop for entry in batch])):
+            item.embedding = vector
+
+
+def _analyse_track(track: VehicleTrack, digits_only: bool = False, artifact_base: Path | None = None,
+                   checkpoint=None) -> TrackAnalysis:
     observations = track.observations
+    selection = select_plate_frames(observations)
     plate_results: list[PlateObservation] = []
     boxes_by_frame: dict[int, tuple[int, int, int, int]] = {}
-    misses = 0
-    for item in observations:
-        result = models.reader.read_vehicle(item.crop, item.frame_idx, item.timestamp_sec, item.target_in_crop,
-                                            item.occluders_in_crop)
+    rejections: Counter = Counter()
+    misses = inspected = 0
+    stopped_stable = stopped_no_plate = 0
+    for position, item in enumerate(selection.selected):
+        if checkpoint:
+            checkpoint()
+        inspected += 1
+        result, reason = models.reader.inspect_vehicle(item.crop, item.frame_idx, item.timestamp_sec,
+                                                       item.target_in_crop, item.occluders_in_crop, item.crop_origin)
         if result is None:
+            rejections[reason or "no plate"] += 1
             misses += 1
             if not plate_results and misses >= MAX_PLATE_MISSES:
+                stopped_no_plate = len(selection.selected) - position - 1
                 break  # The best views show no plate, so weaker views will not help.
             continue
         if artifact_base is not None:
@@ -267,33 +384,48 @@ def _analyse_track(track: VehicleTrack, digits_only: bool = False, artifact_base
                                             read_only=True)
         plate_results.append(result)
         boxes_by_frame[item.frame_idx] = result.bbox_in_crop
+        if reads_are_stable([entry.read for entry in plate_results]):
+            stopped_stable = len(selection.selected) - position - 1
+            break
     reads = [result.read for result in plate_results]
     stacked_read, stacked = models.reader.read_stack(plate_results)
     if stacked_read is not None:
         reads.append(stacked_read)
     fused = fuse_plate_reads(reads, digits_only=digits_only)
 
-    crops = [item.crop for item in observations[:5]]
-    boxes = [boxes_by_frame.get(item.frame_idx) for item in observations[:5]]
-    scenes = [cv2.imdecode(np.frombuffer(item.frame_jpeg, np.uint8), cv2.IMREAD_COLOR) for item in observations[:5]]
+    top = observations[:5]
+    crops = [item.crop for item in top]
+    boxes = [boxes_by_frame.get(item.frame_idx) for item in top]
+    # White balance only needs global statistics, so a reduced decode is sufficient.
+    scenes = [cv2.imdecode(np.frombuffer(item.frame_jpeg, np.uint8), cv2.IMREAD_REDUCED_COLOR_4) for item in top]
     colours = attribute_module.estimate_colour(crops, boxes, scenes)
-    embeddings = models.clip.encode_images(crops) if models.clip.available and crops else None
+    _ensure_embeddings(top)
+    embeddings = np.stack([item.embedding for item in top]) if models.clip.available and top else None
     embedding = mean_embedding(embeddings)
     body = attribute_module.classify_body(track.yolo_class, track.yolo_confidence, embedding, models.clip)
     make = make_model.recognise(embedding, body["label"], models.clip)
     attrs = {"colours": colours, "body_type": body, "make_model": make, "yolo_class": track.yolo_class}
-    return TrackAnalysis(track, plate_results, fused, attrs, embeddings, spatial_hsv_histogram(crops), crops, stacked)
+    inspection = {
+        "candidate_frames": len(observations), "near_duplicates_skipped": selection.near_duplicates,
+        "frames_inspected": inspected, "plates_read": len(plate_results),
+        "skipped_plate_already_stable": stopped_stable, "skipped_no_plate_in_best_frames": stopped_no_plate,
+        "rejections": dict(rejections),
+    }
+    return TrackAnalysis(track, plate_results, fused, attrs, embeddings, spatial_hsv_histogram(crops), crops, stacked,
+                         inspection)
 
 
 def _stitch_tracks(tracks: list[VehicleTrack]) -> tuple[list[VehicleTrack], int]:
     """Merge identity switches, then drop tracks too short or too clipped to be evidence."""
+    leading = {track.track_id: track.observations[:3] for track in tracks}
+    _ensure_embeddings([item for group in leading.values() for item in group])
     vectors: dict[int, np.ndarray] = {}
     for track in tracks:
-        crops = [item.crop for item in track.observations[:3]]
-        if models.clip.available and crops:
-            vectors[track.track_id] = mean_embedding(models.clip.encode_images(crops))
+        group = leading[track.track_id]
+        if models.clip.available and group:
+            vectors[track.track_id] = mean_embedding(np.stack([item.embedding for item in group]))
         else:
-            vectors[track.track_id] = spatial_hsv_histogram(crops)
+            vectors[track.track_id] = spatial_hsv_histogram([item.crop for item in group])
 
     def appearance(a, b) -> float:
         return float(vectors[a.track_id] @ vectors[b.track_id])
@@ -309,9 +441,9 @@ def _stitch_tracks(tracks: list[VehicleTrack]) -> tuple[list[VehicleTrack], int]
 
 
 def _persist_track(session: Session, case: Case, clip: Clip, analysis: TrackAnalysis, registry: RegistryIndex,
-                   base: Path) -> tuple[TrackedVehicle, TrackProfile]:
+                   base: Path, run_id: str | None = None) -> tuple[TrackedVehicle, TrackProfile]:
     track = analysis.track
-    vehicle = TrackedVehicle(case_id=case.id, clip_id=clip.id, track_id=track.track_id,
+    vehicle = TrackedVehicle(case_id=case.id, clip_id=clip.id, run_id=run_id, track_id=track.track_id,
                              first_seen_sec=round(track.first_seen_sec, 3),
                              last_seen_sec=round(track.last_seen_sec, 3), frames_tracked=track.frames_tracked)
     session.add(vehicle)
@@ -357,6 +489,8 @@ def _persist_track(session: Session, case: Case, clip: Clip, analysis: TrackAnal
                 output = plate.variant_outputs.get(name)
                 path = plate.read.crop if name == "raw" else _write_image(base / f"plate_f{item.frame_idx}_{name}.png", image)
                 views.append({"name": name, "label": info["label"], "kind": info["kind"], "image": path,
+                              "width": int(image.shape[1]), "height": int(image.shape[0]),
+                              "ocr_read": name in plate.variants_read,
                               "text": output.text if output else "",
                               "mean_confidence": round(output.score, 4) if output else 0.0})
             enhanced = next(view["image"] for view in views if view["name"] == "gray_clahe")
@@ -367,6 +501,8 @@ def _persist_track(session: Session, case: Case, clip: Clip, analysis: TrackAnal
                 "plate_quality": round(plate.quality, 3),
                 "plate_box_confidence": round(plate.box_confidence, 4),
                 "plate_crop_size": [int(plate.raw_crop.shape[1]), int(plate.raw_crop.shape[0])],
+                "plate_box_source": list(plate.box_in_source) if plate.box_in_source else None,
+                "image_warnings": plate.image_warnings,
                 "crop_sha256": plate.read.crop_sha256,
                 "ocr_engine": plate.read.ocr_engine,
                 "ocr_source": plate.read.source,
@@ -381,6 +517,8 @@ def _persist_track(session: Session, case: Case, clip: Clip, analysis: TrackAnal
     vehicle.keyframes = keyframes
     vehicle.plate_reads = [{**_read_dict(obs.read), "plate_box_confidence": round(obs.box_confidence, 4),
                             "plate_crop_size": [int(obs.raw_crop.shape[1]), int(obs.raw_crop.shape[0])],
+                            "plate_box_source": list(obs.box_in_source) if obs.box_in_source else None,
+                            "variants_read": list(obs.variants_read), "image_warnings": obs.image_warnings,
                             "rectification": obs.rectification.status} for obs in analysis.observations]
     vehicle.fused_plate = {
         **analysis.fused.to_dict(),
@@ -391,6 +529,7 @@ def _persist_track(session: Session, case: Case, clip: Clip, analysis: TrackAnal
         **analysis.attributes,
         "partial_view": track.mostly_truncated,
         "merged_track_ids": track.merged_track_ids,
+        "track_quality": {**assess_track(track), "plate_inspection": analysis.plate_inspection},
     }
     vehicle.ai_evidence = query.model_dump()
     vehicle.active_evidence = query.model_dump()
@@ -433,8 +572,30 @@ def _read_from_dict(item: dict) -> PlateRead:
     )
 
 
+def _flag_repeated_plates(vehicles: list[TrackedVehicle]) -> int:
+    """Flag, but do not merge, different tracks in one clip that read the same complete plate."""
+    groups: dict[tuple[str, str], list[TrackedVehicle]] = {}
+    for vehicle in vehicles:
+        text = (vehicle.fused_plate or {}).get("text", "")
+        if len(text) >= 6 and "?" not in text:
+            groups.setdefault((vehicle.clip_id, text), []).append(vehicle)
+    flagged = 0
+    for members in groups.values():
+        if len(members) < 2:
+            continue
+        for member in members:
+            others = ", ".join(f"T{other.track_id}" for other in members if other is not member)
+            quality = dict(member.attributes["track_quality"])
+            quality["tier"] = "review"
+            quality["reasons"] = [*quality["reasons"], f"same plate also read on {others}"]
+            member.attributes = {**member.attributes, "track_quality": quality}
+            flagged += 1
+    return flagged
+
+
 def _build_entities(session: Session, case: Case, vehicles: dict[str, TrackedVehicle],
-                    profiles: list[TrackProfile], registry: RegistryIndex) -> tuple[int, int]:
+                    profiles: list[TrackProfile], registry: RegistryIndex,
+                    run_id: str | None = None) -> tuple[int, int]:
     groups, links, blocked = link_tracks(profiles)
     tier_order = ["partial_plate", "strong_plate"]
     for group in groups:
@@ -462,7 +623,7 @@ def _build_entities(session: Session, case: Case, vehicles: dict[str, TrackedVeh
         timeline.sort(key=lambda t: (t["absolute_time"] is None, t["absolute_time"] or "", t["first_seen_sec"]))
         group_links = [link for link in links if link["a"] in group and link["b"] in group]
         entity = CrossCameraEntity(
-            case_id=case.id, fused_plate=fused.to_dict(), timeline=timeline, links=group_links,
+            case_id=case.id, run_id=run_id, fused_plate=fused.to_dict(), timeline=timeline, links=group_links,
             match_result=match(query, registry).model_dump(), review_status="proposed",
             evidence_tier=min((link["evidence_tier"] for link in group_links), key=tier_order.index),
         )
@@ -473,33 +634,79 @@ def _build_entities(session: Session, case: Case, vehicles: dict[str, TrackedVeh
     return len(groups), blocked
 
 
+def _plate_from_fused(fused: dict) -> PlateEvidence:
+    slots = [
+        SlotEvidence(char=slot["char"], confidence=slot["confidence"] if slot["char"] != "?" else 0.0,
+                     candidates=[CharCandidate(char=c["char"], probability=c["probability"])
+                                 for c in slot.get("candidates", [])])
+        for slot in fused.get("slots", [])
+    ]
+    return PlateEvidence(slots=slots, anchor="full" if len(slots) >= 9 else "floating")
+
+
+def rescore_case(session: Session, case: Case, actor: str = "Investigator") -> dict:
+    """Compare existing OCR evidence with the current registry. OCR evidence is not modified."""
+    registry = load_registry(session)
+    before = Counter((v.match_result or {}).get("outcome") for v in case.completed_vehicles)
+    for vehicle in case.completed_vehicles:
+        evidence = QueryEvidence.model_validate(vehicle.active_evidence)
+        evidence.plate_format = vehicle.clip.plate_format
+        vehicle.active_evidence = evidence.model_dump()
+        vehicle.match_result = match(evidence, registry).model_dump()
+    for entity in case.completed_entities:
+        members = [v for v in entity.vehicles if v.run_id == case.active_run_id]
+        if not members:
+            continue
+        formats = {m.clip.plate_format for m in members} - {"latin_any"}
+        best = max(members, key=lambda v: v.frames_tracked)
+        query = build_query(_plate_from_fused(entity.fused_plate), best.attributes,
+                            formats.pop() if len(formats) == 1 else "latin_any")
+        entity.match_result = match(query, registry).model_dump()
+    after = Counter((v.match_result or {}).get("outcome") for v in case.completed_vehicles)
+    case.runtime = {**(case.runtime or {}), "registry_fingerprint": registry.fingerprint()}
+    session.add(AuditEvent(case_id=case.id, actor=actor, action="REGISTRY_RESCORED",
+                           note=f"OCR evidence unchanged. Outcomes before: {dict(before)}. After: {dict(after)}."))
+    session.commit()
+    return {"before": dict(before), "after": dict(after), "tracks": len(case.completed_vehicles)}
+
+
 def refresh_legacy_results(session: Session) -> int:
     """Re-score stored results from older releases so outdated verdicts are never displayed."""
     registry = load_registry(session)
     updated = 0
     for vehicle in session.scalars(select(TrackedVehicle)).all():
-        if "outcome" in (vehicle.match_result or {}) or not vehicle.active_evidence:
+        if "registry_coverage" in (vehicle.match_result or {}) or not vehicle.active_evidence:
             continue
         vehicle.match_result = match(QueryEvidence.model_validate(vehicle.active_evidence), registry).model_dump()
         updated += 1
     for entity in session.scalars(select(CrossCameraEntity)).all():
-        if "outcome" in (entity.match_result or {}) or not entity.vehicles:
+        if "registry_coverage" in (entity.match_result or {}) or not entity.vehicles:
             continue
         best = max(entity.vehicles, key=lambda v: v.frames_tracked)
-        plate = PlateEvidence.from_text(entity.fused_plate.get("text", ""), 0.8)
-        entity.match_result = match(build_query(plate, best.attributes), registry).model_dump()
-        entity.review_status = "proposed"
-        entity.evidence_tier = "legacy_unverified"
+        formats = {v.clip.plate_format for v in entity.vehicles} - {"latin_any"}
+        query = build_query(_plate_from_fused(entity.fused_plate), best.attributes,
+                            formats.pop() if len(formats) == 1 else "latin_any")
+        entity.match_result = match(query, registry).model_dump()
+        if "outcome" not in (entity.match_result or {}):
+            entity.review_status = "proposed"
+            entity.evidence_tier = "legacy_unverified"
         updated += 1
     session.commit()
     return updated
 
 
 def run_pipeline(case_id: str) -> None:
-    publish = lambda stage, pct, msg: progress_bus.publish(case_id, stage, pct, msg)  # noqa: E731
+    def publish(stage: str, pct: float, msg: str, **extra) -> None:
+        progress_bus.publish(case_id, stage, pct, msg, **extra)
+
+    def checkpoint() -> None:
+        _checkpoint(case_id)
+
     publish("models", 2, "Loading computer vision models")
     models.load()
+    checkpoint()
     started = time.perf_counter()
+    stage_seconds: Counter = Counter()
 
     with SessionLocal() as session:
         case = session.get(Case, case_id)
@@ -508,17 +715,18 @@ def run_pipeline(case_id: str) -> None:
         clips = list(case.clips)
         if not clips:
             raise ValueError("Case has no clips")
+        publish("integrity", 3, f"Verifying SHA-256 for {len(clips)} clip(s)")
+        mark = time.perf_counter()
+        for clip in clips:
+            verify_clip_integrity(clip)
+        stage_seconds["integrity"] += time.perf_counter() - mark
+        # Earlier completed results stay in place until this run finishes.
+        run_id = f"run_{uuid.uuid4().hex[:10]}"
         case.status = "RUNNING"
         case.error = None
-        case.pipeline_version = PIPELINE_VERSION
-        case.runtime = models.status()
-        session.execute(delete(TrackedVehicle).where(TrackedVehicle.case_id == case.id))
-        session.execute(delete(CrossCameraEntity).where(CrossCameraEntity.case_id == case.id))
+        case.live_run_id = run_id
         session.commit()
-        session.expire_all()
-        run_id = f"run_{uuid.uuid4().hex[:10]}"  # Earlier runs' raw crops are preserved, not overwritten.
         registry = load_registry(session)
-        clips = list(session.get(Case, case_id).clips)
 
         vehicles: dict[str, TrackedVehicle] = {}
         profiles: list[TrackProfile] = []
@@ -527,45 +735,91 @@ def run_pipeline(case_id: str) -> None:
             base = 5 + span * clip_index
             label = clip.camera_label
             path = Path(clip.stored_path)
-            verify_clip_integrity(clip)
             metadata = probe_video(path)
             estimated = max(min(int(metadata.duration_sec * settings.sample_fps), settings.max_frames_per_clip), 1)
             stats = SamplingStats()
-            publish("tracking", base, f"{label}: detecting and tracking vehicles")
+            publish("tracking", base, f"{label}: detecting and tracking vehicles", clip_index=clip_index + 1,
+                    clip_count=len(clips))
 
             def on_frame(count: int) -> None:
+                checkpoint()
                 if count % 5 == 0:
-                    publish("tracking", base + span * 0.5 * min(count / estimated, 1.0),
-                            f"{label}: tracked {count} of about {estimated} sampled frames")
+                    publish("tracking", base + span * 0.35 * min(count / estimated, 1.0),
+                            f"{label}: tracked {count} of about {estimated} sampled frames", clip_index=clip_index + 1,
+                            clip_count=len(clips), frames_done=count, frames_total=estimated)
 
+            mark = time.perf_counter()
             raw_tracks = models.detector.track_clip(sample_frames(path, metadata, stats=stats), on_frame)
-            publish("tracking", base + span * 0.5, f"{label}: merging duplicate tracks")
+            stage_seconds["tracking"] += time.perf_counter() - mark
+            checkpoint()
+            publish("stitching", base + span * 0.35, f"{label}: merging fragments of {len(raw_tracks)} raw track(s)")
+            mark = time.perf_counter()
             tracks, merges = _stitch_tracks(raw_tracks)
+            stage_seconds["stitching"] += time.perf_counter() - mark
             clip.processing = {**stats.as_dict(), "raw_tracks": len(raw_tracks), "fragments_merged": merges,
-                               "tracks": len(tracks)}
-            for track_index, track in enumerate(tracks):
-                publish("recognition", base + span * (0.5 + 0.5 * track_index / max(len(tracks), 1)),
-                        f"{label}: reading plate and attributes for vehicle {track_index + 1} of {len(tracks)}")
-                artifact_base = settings.artifact_dir / case.id / run_id / clip.id / f"track_{track.track_id}"
-                analysis = _analyse_track(track, digits_only=clip.plate_format == "non_latin_digits",
-                                          artifact_base=artifact_base)
-                vehicle, profile = _persist_track(session, case, clip, analysis, registry, artifact_base)
-                vehicles[vehicle.id] = vehicle
-                profiles.append(profile)
+                               "tracks": len(tracks), "dropped_short_or_clipped": len(raw_tracks) - merges - len(tracks)}
+            digits_only = clip.plate_format == "non_latin_digits"
+            mark = time.perf_counter()
+            clip_vehicles: list[TrackedVehicle] = []
+            with ThreadPoolExecutor(max_workers=models.reader.workers, thread_name_prefix="track") as pool:
+                futures = {
+                    pool.submit(_analyse_track, track, digits_only,
+                                settings.artifact_dir / case.id / run_id / clip.id / f"track_{track.track_id}",
+                                checkpoint): track
+                    for track in tracks
+                }
+                try:
+                    for done, future in enumerate(as_completed(futures), start=1):
+                        analysis = future.result()
+                        track = futures[future]
+                        artifact_base = settings.artifact_dir / case.id / run_id / clip.id / f"track_{track.track_id}"
+                        vehicle, profile = _persist_track(session, case, clip, analysis, registry, artifact_base, run_id)
+                        vehicles[vehicle.id] = vehicle
+                        clip_vehicles.append(vehicle)
+                        profiles.append(profile)
+                        track._heap.clear()  # Release frame crops as soon as evidence is stored.
+                        if done % COMMIT_EVERY_TRACKS == 0 or done == len(tracks):
+                            session.commit()
+                        publish("recognition", base + span * (0.4 + 0.6 * done / max(len(tracks), 1)),
+                                f"{label}: analysed {done} of {len(tracks)} vehicle tracks",
+                                clip_index=clip_index + 1, clip_count=len(clips),
+                                tracks_done=len(vehicles), tracks_in_clip=len(tracks))
+                except BaseException:
+                    for future in futures:
+                        future.cancel()
+                    raise
+            stage_seconds["recognition"] += time.perf_counter() - mark
+            clip.processing = {**clip.processing, "repeated_plate_tracks": _flag_repeated_plates(clip_vehicles)}
             session.commit()
 
-        publish("reid", 93, "Linking vehicles across cameras")
-        entity_count, blocked_links = _build_entities(session, case, vehicles, profiles, registry)
+        checkpoint()
+        publish("reid", 93, "Comparing tracks across cameras" if len(clips) > 1 else "One clip: skipping camera comparison")
+        mark = time.perf_counter()
+        entity_count, blocked_links = _build_entities(session, case, vehicles, profiles, registry, run_id)
+        stage_seconds["reid"] += time.perf_counter() - mark
         session.add(AuditEvent(case_id=case.id, actor="system", action="EVIDENCE_VERIFIED",
                                note=f"All {len(clips)} clip hash(es) matched before analysis ({run_id})"))
+        checkpoint()
         publish("report", 98, "Finalising case record")
+        session.flush()
+        session.execute(delete(TrackedVehicle).where(
+            TrackedVehicle.case_id == case.id, or_(TrackedVehicle.run_id.is_(None), TrackedVehicle.run_id != run_id)))
+        session.execute(delete(CrossCameraEntity).where(
+            CrossCameraEntity.case_id == case.id,
+            or_(CrossCameraEntity.run_id.is_(None), CrossCameraEntity.run_id != run_id)))
+        case.active_run_id = run_id
+        case.live_run_id = None
+        case.pipeline_version = PIPELINE_VERSION
         case.status = "COMPLETED"
         case.runtime = {**models.status(), "elapsed_sec": round(time.perf_counter() - started, 2),
-                        "vehicles": len(vehicles), "entities": entity_count, "links_blocked_by_plate": blocked_links}
+                        "vehicles": len(vehicles), "entities": entity_count, "links_blocked_by_plate": blocked_links,
+                        "stage_seconds": {key: round(value, 1) for key, value in stage_seconds.items()},
+                        "analysis_workers": models.reader.workers, "ocr_cache_hits": models.reader.cache_hits,
+                        "registry_fingerprint": registry.fingerprint(), "run_id": run_id}
         session.add(AuditEvent(case_id=case.id, actor="system", action="ANALYSIS_COMPLETED",
                                note=f"{len(vehicles)} vehicle(s), {entity_count} possible cross-camera link(s), "
                                     f"pipeline {PIPELINE_VERSION}"))
         session.commit()
         progress_bus.publish(case_id, "done", 100,
                              f"Analysis complete: {len(vehicles)} vehicle(s), {entity_count} possible cross-camera link(s)",
-                             "COMPLETED")
+                             "COMPLETED", tracks_done=len(vehicles))

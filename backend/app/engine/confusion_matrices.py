@@ -108,6 +108,14 @@ def plate_family(plate: str) -> str:
     return "other"
 
 
+PLATE_FORMAT_NAMES = {
+    "latin_any": "Latin A-Z, 0-9",
+    "india_rto": "India RTO / BH",
+    "uk": "UK",
+    "non_latin_digits": "Non-Latin, digits only",
+}
+
+
 def format_accepts(plate_format: str, family: str) -> bool:
     """Whether a registry family can be compared with reads from a camera's plate format."""
     if plate_format == "latin_any":

@@ -7,7 +7,8 @@ from pydantic import BaseModel, Field
 
 UNKNOWN = "?"
 Anchor = Literal["full", "prefix", "suffix", "floating"]
-Outcome = Literal["PLATE_CANDIDATE", "AMBIGUOUS", "NO_REGISTRY_MATCH", "INSUFFICIENT_PLATE", "UNREADABLE_PLATE"]
+Outcome = Literal["PLATE_CANDIDATE", "AMBIGUOUS", "NO_REGISTRY_MATCH", "NO_REGISTRY_COVERAGE",
+                  "INSUFFICIENT_PLATE", "UNREADABLE_PLATE"]
 
 
 class CharCandidate(BaseModel):
@@ -131,6 +132,15 @@ class AttributeSuggestions(BaseModel):
     basis: list[str] = Field(default_factory=list)
 
 
+class RegistryCoverage(BaseModel):
+    """Whether a compatible registry search was actually possible for this camera's plate format."""
+
+    plate_format: str
+    compatible_records: int
+    total_records: int
+    searched: bool
+
+
 class MatchResult(BaseModel):
     status: Literal["CONFIDENT_SHORTLIST", "NO_CONFIDENT_MATCH"]
     outcome: Outcome
@@ -141,6 +151,7 @@ class MatchResult(BaseModel):
     candidates: list[Candidate]
     rejected_candidates: list[Candidate]
     attribute_suggestions: AttributeSuggestions = Field(default_factory=AttributeSuggestions)
+    registry_coverage: RegistryCoverage | None = None
     diagnostics: list[str]
     thresholds: dict[str, float] = Field(default_factory=dict)
     score_is_calibrated: bool = False

@@ -50,6 +50,8 @@ class TrackObservation:
     frame_brightness: float = 0.0
     frame_contrast: float = 0.0
     low_sharpness: bool = False
+    crop_origin: tuple[int, int] = (0, 0)
+    embedding: np.ndarray | None = None
 
 
 @dataclass
@@ -62,6 +64,8 @@ class VehicleTrack:
     class_votes: Counter = field(default_factory=Counter)
     trajectory: list[tuple[float, tuple[int, int, int, int]]] = field(default_factory=list)
     merged_track_ids: list[int] = field(default_factory=list)
+    confidence_sum: float = 0.0
+    occlusion_sum: float = 0.0
     _heap: list = field(default_factory=list)
 
     @property
@@ -100,6 +104,8 @@ class VehicleTrack:
         self.last_seen_sec = max(self.last_seen_sec, observation.timestamp_sec)
         self.first_seen_sec = min(self.first_seen_sec, observation.timestamp_sec)
         self.class_votes[label] += score
+        self.confidence_sum += observation.confidence
+        self.occlusion_sum += observation.lower_occlusion
         self.trajectory.append((observation.timestamp_sec, observation.bbox))
         self._keep(observation)
 
@@ -108,6 +114,8 @@ class VehicleTrack:
         self.frames_tracked += other.frames_tracked - len(shared)
         self.truncated_frames += other.truncated_frames
         self.truncated_frames = min(self.truncated_frames, self.frames_tracked)
+        self.confidence_sum += other.confidence_sum
+        self.occlusion_sum += other.occlusion_sum
         self.first_seen_sec = min(self.first_seen_sec, other.first_seen_sec)
         self.last_seen_sec = max(self.last_seen_sec, other.last_seen_sec)
         self.class_votes.update(other.class_votes)
@@ -239,6 +247,6 @@ class VehicleDetectorTracker:
                                  sharpness_score(crop), crop, frame_jpeg, scene_scale, truncated,
                                  lower_occlusion(xyxy, in_front), occluders,
                                  (x1 - cx1, y1 - cy1, x2 - cx1, y2 - cy1), frame.sharpness, frame.brightness,
-                                 frame.contrast, frame.low_sharpness),
+                                 frame.contrast, frame.low_sharpness, (cx1, cy1)),
                 COCO_VEHICLES[int(cls)], float(conf),
             )

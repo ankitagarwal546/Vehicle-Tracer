@@ -183,10 +183,10 @@ def test_report_counts_match_case_summary_and_clip_scope(client):
     case_id, clip_id = _case_with_outcomes()
     summary = client.get(f"/api/cases/{case_id}").json()["summary"]
     assert (summary["tracks"], summary["plate_candidates"], summary["unreadable_plate"],
-            summary["no_registry_match"]) == (3, 1, 1, 1)
+            summary["no_registry_match"], summary["no_registry_coverage"]) == (3, 1, 1, 0, 1)
     report = client.get(f"/api/cases/{case_id}/report/html").text
-    for value, label in ((3, "Vehicle tracks"), (1, "Plate-supported"), (1, "No registry match"),
-                         (1, "Plate unreadable")):
+    for value, label in ((3, "Vehicle tracks"), (1, "Plate-supported"), (0, "No registry match"),
+                         (1, "No registry coverage"), (1, "Plate unreadable")):
         assert f"<b>{value}</b><span>{label}</span>" in report
     assert "Synthetic test fixture" in report
     scoped = client.get(f"/api/cases/{case_id}/report/html", params={"clip_id": clip_id}).text

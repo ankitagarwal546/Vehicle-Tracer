@@ -54,7 +54,10 @@ def _add_missing_columns() -> None:
             "latitude": "FLOAT",
             "longitude": "FLOAT",
         },
+        "cases": {"active_run_id": "VARCHAR(16)", "live_run_id": "VARCHAR(16)"},
+        "tracked_vehicles": {"run_id": "VARCHAR(16)"},
         "cross_camera_entities": {
+            "run_id": "VARCHAR(16)",
             "review_status": "VARCHAR(16) NOT NULL DEFAULT 'proposed'",
             "evidence_tier": "VARCHAR(32) NOT NULL DEFAULT 'legacy_unverified'",
             "reviewed_by": "VARCHAR(120)",

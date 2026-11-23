@@ -26,6 +26,7 @@
   .evidence-grid { display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 3fr); gap: 12px; }
   .evidence img { width: 100%; display: block; border: 1px solid #E2E8F0; }
   .plates { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; margin-top: 4px; font-size: 10px; color: #475569; }
+  .plates-large img { min-height: 72px; object-fit: contain; image-rendering: pixelated; background: #F1F5F9; }
   .char { display: inline-block; width: 17px; text-align: center; border: 1px solid #CBD5E1; margin-right: -1px; font-family: Menlo, Consolas, monospace; font-weight: 600; }
   .exact { background: #D1FAE5; } .confusable { background: #FEF3C7; } .mismatch, .hard_mismatch { background: #FFE4E6; } .unknown, .unobserved { background: #F1F5F9; color: #64748B; }
   td.cell { text-align: center; padding: 2px; font-family: Menlo, Consolas, monospace; }
@@ -36,13 +37,13 @@
 </style>
 </head>
 <body><main>
-<h1>Vehicle Identification Forensic Report{% if scope_label %}: {{ scope_label }}{% endif %}</h1>
+<h1>VITRA Vehicle Identification Forensic Report{% if scope_label %}: {{ scope_label }}{% endif %}</h1>
 {% if has_synthetic_clip %}<div class="verdict warn"><strong>Synthetic test fixture</strong> Clips, plates, vehicles and owners in this report are fictional.</div>{% endif %}
 <div class="muted">Case <span class="mono">{{ case.id }}</span> · {{ case.title }} · Generated {{ generated_at }} UTC · Pipeline {{ case.pipeline_version or "n/a" }}</div>
 
 <h2>Executive Summary</h2>
-<div class="verdict {{ 'ok' if summary.plate_candidates else 'warn' if summary.ambiguous else 'no' }}">
-  <strong>{% if summary.plate_candidates %}{{ summary.plate_candidates }} plate-supported candidate{{ "s" if summary.plate_candidates != 1 }}{% elif summary.ambiguous %}No single match, {{ summary.ambiguous }} ambiguous{% else %}No confident match{% endif %}</strong>
+<div class="verdict {{ 'ok' if summary.plate_candidates else 'warn' if summary.ambiguous or summary.no_registry_coverage else 'no' }}">
+  <strong>{% if summary.plate_candidates %}{{ summary.plate_candidates }} plate-supported candidate{{ "s" if summary.plate_candidates != 1 }}{% elif summary.ambiguous %}No single match, {{ summary.ambiguous }} ambiguous{% elif summary.no_registry_coverage %}No registry coverage: plates were read but not searched{% else %}No confident match{% endif %}</strong>
   {{ summary.tracks }} vehicle track(s) across {{ clips|length }} clip(s). {{ headline }}
 </div>
 <div class="stats">
@@ -50,12 +51,24 @@
   <div><b>{{ summary.plate_candidates }}</b><span>Plate-supported</span></div>
   <div><b>{{ summary.ambiguous }}</b><span>Ambiguous</span></div>
   <div><b>{{ summary.no_registry_match }}</b><span>No registry match</span></div>
+  <div><b>{{ summary.no_registry_coverage }}</b><span>No registry coverage</span></div>
   <div><b>{{ summary.insufficient_plate }}</b><span>Partial plate only</span></div>
   <div><b>{{ summary.unreadable_plate }}</b><span>Plate unreadable</span></div>
   <div><b>{{ summary.possible_links }}</b><span>Links to review</span></div>
-  <div><b>{{ summary.confirmed_links }}</b><span>Confirmed links</span></div>
+  <div><b>{{ summary.readable_plates }}</b><span>Readable plates</span></div>
+  <div><b>{{ summary.partial_plates }}</b><span>Partial plates</span></div>
+  <div><b>{{ summary.no_plate_chars }}</b><span>No characters</span></div>
+  <div><b>{{ summary.tracks_review }}</b><span>Tracks to review</span></div>
 </div>
-<p class="note">Results are investigative leads and do not establish vehicle or owner identity. Unreadable characters remain <span class="mono">?</span> and are never inferred. Match scores are uncalibrated ranking values, not probabilities. {{ registry_note }}{% if missing_time %} {{ missing_time }} clip(s) have no capture time, so temporal checks involving them were not validated.{% endif %}</p>
+<p class="note">Results are investigative leads and do not establish vehicle or owner identity. Unreadable characters remain <span class="mono">?</span> and are never inferred. {{ summary.score_note }} {{ registry_note }}</p>
+<p class="note"><strong>Temporal validation:</strong> {{ summary.temporal_note }}<br><strong>Cross-camera status:</strong> {{ summary.cross_camera_note }}</p>
+
+<h2>Registry Coverage</h2>
+<div class="scroll"><table><tr><th>Camera</th><th>Plate format</th><th>Compatible records</th><th>Registry records</th><th>Status</th></tr>
+{% for row in summary.coverage %}<tr><td>{{ row.camera_label }}</td><td>{{ row.format_label }}</td><td class="mono">{{ row.compatible_records }}</td><td class="mono">{{ row.total_records }}</td><td>{{ "No coverage" if row.status == "no_coverage" else "Covered" }}</td></tr>{% endfor %}</table></div>
+{% if summary.no_registry_coverage %}<div class="verdict warn"><strong>{{ summary.no_registry_coverage }} readable plate(s) were not searched.</strong> The registry has no compatible records for their format. They remain OCR evidence and are not no-match results.</div>{% endif %}
+
+{% for hint in summary.format_hints %}<div class="verdict warn"><strong>Possible format gap</strong> {{ hint.message }}</div>{% endfor %}
 
 <h2>Evidence Integrity</h2>
 <div class="scroll"><table><tr><th>Camera</th><th>File</th><th>SHA-256</th><th>Ingested (UTC)</th><th>Capture time (UTC)</th><th>Plate format</th><th>Technical</th></tr>
@@ -84,16 +97,32 @@
 {% if hidden_key %}<p class="note">{{ hidden_key }} further track(s) with registry candidates are listed in the appendix.</p>{% endif %}
 {% else %}<p>No track had enough plate evidence to shortlist a registry vehicle. See the outcome counts above.</p>{% endif %}
 
-{% if no_match_rows %}<h2>No-Match Outcomes</h2>
+{% if ocr_examples %}<h2>OCR Evidence Examples</h2>
+<p class="note">Enhanced views help review and do not add source detail. Only the raw crop is source evidence.</p>
+{% for v in ocr_examples %}{% set k = v.keyframes[0] %}<section class="evidence">
+  <h3 style="margin-top:0">{{ v.camera_label }} · Track {{ v.track_id }} · <span class="mono">{{ v.match.query_plate or "plate not read" }}</span> · {{ v.outcome_label }}</h3>
+  <div class="plates plates-large"><div>Raw source crop<img src="{{ k.raw_uri }}" alt="Raw plate"></div><div>Enhanced for viewing (CLAHE)<img src="{{ k.enhanced_uri }}" alt="Enhanced plate"></div></div>
+  <div class="note">{{ v.provenance }}</div>
+  <div style="margin:4px 0">{% for s in v.fused_plate.slots %}<span class="char {{ 'unknown' if s.char == '?' else '' }}">{{ s.char }}</span>{% endfor %}</div>
+  <ul>{% for n in v.image_warnings %}<li>{{ n }}</li>{% endfor %}{% for n in v.unknown_notes %}<li>{{ n }}</li>{% endfor %}</ul>
+</section>{% endfor %}{% endif %}
+
+{% if no_coverage_rows %}<h2>Plates Not Searched: No Registry Coverage</h2>
+<div class="scroll"><table><tr><th>Camera</th><th>Track</th><th>OCR plate read</th><th>Compatible records</th></tr>
+{% for v in no_coverage_rows %}<tr><td>{{ v.camera_label }}</td><td class="mono">{{ v.track_id }}</td><td class="mono">{{ v.match.query_plate }}</td><td class="mono">{{ v.match.registry_coverage.compatible_records if v.match.registry_coverage else 0 }}</td></tr>{% endfor %}</table></div>
+{% if hidden_no_coverage %}<p class="note">{{ hidden_no_coverage }} more are listed in the appendix.</p>{% endif %}{% endif %}
+
+{% if no_match_rows %}<h2>No-Match Outcomes (Compatible Registry Searched)</h2>
 <div class="scroll"><table><tr><th>Camera</th><th>Track</th><th>Recovered plate</th><th>Reason</th></tr>
 {% for v in no_match_rows %}<tr><td>{{ v.camera_label }}</td><td class="mono">{{ v.track_id }}</td><td class="mono">{{ v.match.query_plate }}</td><td>{{ v.match.diagnostics[0] if v.match.diagnostics else "No registry match" }}</td></tr>{% endfor %}</table></div>
 {% if hidden_no_match %}<p class="note">{{ hidden_no_match }} more are listed in the appendix.</p>{% endif %}{% endif %}
 
 <h2>Cross-Camera Links</h2>
+<p class="note">{{ summary.cross_camera_note }}</p>
 {% if entities %}<div class="scroll"><table><tr><th>Review status</th><th>Evidence</th><th>Sightings</th><th>Plate if merged</th><th>Temporal check</th></tr>
 {% for e in entities %}<tr><td>{{ e.status_label }}</td><td>{{ e.tier_label }}</td><td>{% for t in e.timeline %}{{ t.camera_label }} <span class="mono">{{ t.plate or "unread" }}</span>{% if not loop.last %}<br>{% endif %}{% endfor %}</td><td class="mono">{{ e.fused_plate.text or "unread" }}</td><td>{% for l in e.links %}{{ l.temporal_note }}{% if not loop.last %}<br>{% endif %}{% endfor %}</td></tr>{% endfor %}</table></div>
 <p class="note">A possible link is unverified until an investigator confirms it.</p>
-{% else %}<p>No pair of tracks had enough independent evidence to propose a link.</p>{% endif %}
+{% elif summary.cross_camera_status == "evaluated" %}<p>No pair of tracks had enough independent evidence to propose a link.</p>{% endif %}
 
 <h2>Audit Log</h2>
 <div class="scroll"><table><tr><th>Time (UTC)</th><th>Actor</th><th>Action</th><th>Field</th><th>AI extracted</th><th>Investigator</th></tr>
@@ -102,12 +131,14 @@
 
 {% if appendix %}
 <h2>Appendix</h2>
-<details><summary>All {{ vehicles|length }} tracks</summary><div class="scroll"><table><tr><th>Camera</th><th>Track</th><th>Seen</th><th>Fused plate</th><th>Outcome</th><th>Colour</th><th>Body</th></tr>
-{% for v in vehicles %}<tr><td>{{ v.camera_label }}</td><td class="mono">{{ v.track_id }}</td><td class="mono">{{ v.first_seen_sec }}–{{ v.last_seen_sec }} s</td><td class="mono">{{ v.match.query_plate or "not read" }}</td><td>{{ v.outcome_label }}</td><td>{{ v.attributes.colours[0].label if v.attributes.colours else "unknown" }}</td><td>{{ v.attributes.body_type.label|pretty }}</td></tr>{% endfor %}</table></div></details>
+<details><summary>All {{ vehicles|length }} tracks</summary><div class="scroll"><table><tr><th>Camera</th><th>Track</th><th>Seen</th><th>Fused plate</th><th>Outcome</th><th>Track quality</th><th>Colour</th><th>Body</th></tr>
+{% for v in vehicles %}<tr><td>{{ v.camera_label }}</td><td class="mono">{{ v.track_id }}</td><td class="mono">{{ v.first_seen_sec }}–{{ v.last_seen_sec }} s</td><td class="mono">{{ v.match.query_plate or "not read" }}</td><td>{{ v.outcome_label }}</td><td>{{ v.quality.tier or "not assessed" }}{% if v.quality.reasons %}<br><span class="muted">{{ v.quality.reasons|join("; ") }}</span>{% endif %}</td><td>{{ v.attributes.colours[0].label if v.attributes.colours else "unknown" }}</td><td>{{ v.attributes.body_type.label|pretty }}</td></tr>{% endfor %}</table></div></details>
 <details><summary>Per-frame character recovery for {{ matrix_vehicles|length }} track(s) with plate reads</summary>
 {% for v in matrix_vehicles %}<h3>{{ v.camera_label }} · Track {{ v.track_id }}</h3><div class="scroll"><table><tr><th>Time</th>{% for s in v.fused_plate.slots %}<th>{{ loop.index }}</th>{% endfor %}</tr>
 {% for row in v.fused_plate.matrix %}<tr><td class="mono">{{ "stack" if row.derived else row.timestamp_sec ~ " s" }}</td>{% for c in row.cells %}<td class="cell">{{ c.char }}</td>{% endfor %}</tr>{% endfor %}
 <tr><th>Fused</th>{% for s in v.fused_plate.slots %}<th class="mono">{{ s.char }}</th>{% endfor %}</tr></table></div>{% endfor %}</details>
+<details><summary>Rejected reads for {{ rejected_read_vehicles|length }} track(s)</summary><div class="scroll"><table><tr><th>Camera</th><th>Track</th><th>Frame</th><th>Read</th><th>Why it was rejected</th></tr>
+{% for v in rejected_read_vehicles %}{% for r in v.rejected_reads %}<tr><td>{{ v.camera_label }}</td><td class="mono">{{ v.track_id }}</td><td class="mono">{{ r.frame_idx }}</td><td class="mono">{{ r.raw_text }}</td><td>{{ r.reason }}</td></tr>{% endfor %}{% endfor %}</table></div></details>
 <details><summary>Full audit log ({{ audit|length }} events)</summary><div class="scroll"><table><tr><th>Time (UTC)</th><th>Actor</th><th>Action</th><th>Field</th><th>AI extracted</th><th>Investigator</th><th>Note</th></tr>
 {% for e in audit %}<tr><td class="mono">{{ e.created_at }}</td><td>{{ e.actor }}</td><td>{{ e.action|pretty|lower }}</td><td>{{ e.field or "" }}</td><td class="mono hash">{{ e.ai_extracted or "" }}</td><td class="mono">{{ e.investigator_verified or "" }}</td><td>{{ e.note or "" }}</td></tr>{% endfor %}</table></div></details>
 {% endif %}

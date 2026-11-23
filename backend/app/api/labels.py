@@ -5,6 +5,7 @@ OUTCOME_LABELS = {
     "PLATE_CANDIDATE": "Plate-supported candidate",
     "AMBIGUOUS": "Ambiguous candidates",
     "NO_REGISTRY_MATCH": "No registry match",
+    "NO_REGISTRY_COVERAGE": "No registry coverage",
     "INSUFFICIENT_PLATE": "Partial plate only",
     "UNREADABLE_PLATE": "Plate unreadable",
 }

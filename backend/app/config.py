@@ -6,7 +6,7 @@ from pathlib import Path
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 BACKEND_DIR = Path(__file__).resolve().parent.parent
-PIPELINE_VERSION = "2.1.0"
+PIPELINE_VERSION = "2.2.0"
 
 
 class Settings(BaseSettings):
@@ -43,6 +43,7 @@ class Settings(BaseSettings):
     registry_size: int = 5000
     allow_model_download: bool = False
     max_plausible_speed_kmh: float = 140.0
+    analysis_workers: int = 0  # 0: half the CPU cores, capped at 4
     max_upload_mb: int = 1024
 
 
