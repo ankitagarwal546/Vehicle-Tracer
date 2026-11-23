@@ -108,7 +108,7 @@ export function Shortlist({ result }: { result: MatchResult }) {
         <span className="num">{result.registry_size.toLocaleString()} vehicles · {result.elapsed_ms.toFixed(1)} ms</span>
       </div>
       {result.candidates.length > 0 && (
-        <div className="border-b border-line bg-canvas px-3 py-1 text-2xs text-muted">Scores are uncalibrated ranking values, not probabilities.</div>
+        <div className="border-b border-line bg-canvas px-3 py-1 text-2xs text-muted">Ordered by plate evidence. Scores are uncalibrated, not probabilities.</div>
       )}
       {result.candidates.map((candidate, index) => (
         <CandidateRow key={candidate.vehicle.plate} candidate={candidate} open={index === 0} />
@@ -116,7 +116,7 @@ export function Shortlist({ result }: { result: MatchResult }) {
       {result.rejected_candidates.length > 0 && (
         <>
           <div className="border-y border-line bg-canvas px-3 py-1 text-2xs font-semibold text-muted">
-            {result.outcome === "AMBIGUOUS" ? "Plates that remain possible, not identifications" : "Closest registry plates, not identifications"}
+            {result.outcome === "AMBIGUOUS" ? "Plates that remain possible, not identifications" : "Closest registry plates by plate evidence, not identifications"}
           </div>
           {result.rejected_candidates.map((candidate) => (
             <CandidateRow key={candidate.vehicle.plate} candidate={candidate} open={false} rejected />

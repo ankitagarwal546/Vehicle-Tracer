@@ -3,7 +3,7 @@ import { useCallback, useEffect, useRef, useState, type FormEvent } from "react"
 import { api } from "../api/client";
 import { Shortlist } from "../components/Shortlist";
 import { Badge, Empty, Pagination, RegistryStatus, pretty } from "../components/ui";
-import { BODY_TYPES, COLOURS, type MatchResult, type RegistryVehicle } from "../types";
+import { BODY_TYPES, COLOURS, PLATE_FORMATS, type MatchResult, type PlateFormat, type RegistryVehicle } from "../types";
 
 const PAGE_SIZE = 25;
 const PRESETS = [
@@ -36,6 +36,7 @@ export default function RegistryManager({ onError, onRegistryChanged }: { onErro
   const [plateConf, setPlateConf] = useState(0.9);
   const [testColour, setTestColour] = useState("white");
   const [testBody, setTestBody] = useState("suv");
+  const [testFormat, setTestFormat] = useState<PlateFormat>("latin_any");
   const [result, setResult] = useState<MatchResult | null>(null);
   const [running, setRunning] = useState(false);
   const file = useRef<HTMLInputElement>(null);
@@ -81,7 +82,7 @@ export default function RegistryManager({ onError, onRegistryChanged }: { onErro
   const runMatch = async (value = plate, colourValue = testColour, bodyValue = testBody) => {
     setRunning(true);
     try {
-      setResult(await api.matchTest({ plate: value, plate_confidence: plateConf, colour: colourValue || undefined, body_type: bodyValue || undefined, body_confidence: 0.8 }));
+      setResult(await api.matchTest({ plate: value, plate_confidence: plateConf, plate_format: testFormat, colour: colourValue || undefined, body_type: bodyValue || undefined, body_confidence: 0.8 }));
     } catch (error) {
       onError((error as Error).message);
     } finally {
@@ -163,6 +164,7 @@ export default function RegistryManager({ onError, onRegistryChanged }: { onErro
               <label><span className="label">Colour</span><select className="field" value={testColour} onChange={(e) => setTestColour(e.target.value)}><option value="">Unknown</option>{COLOURS.map((v) => <option key={v} value={v}>{v}</option>)}</select></label>
               <label><span className="label">Body type</span><select className="field" value={testBody} onChange={(e) => setTestBody(e.target.value)}><option value="">Unknown</option>{BODY_TYPES.map((v) => <option key={v} value={v}>{pretty(v)}</option>)}</select></label>
             </div>
+            <label className="block"><span className="label">Camera plate format</span><select className="field" value={testFormat} onChange={(e) => setTestFormat(e.target.value as PlateFormat)}>{PLATE_FORMATS.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}</select></label>
             <button className="btn btn-primary w-full" disabled={running}>{running ? "Matching…" : "Run matcher"}</button>
           </form>
           {result && <Shortlist key={`${result.query_plate}-${result.elapsed_ms}`} result={result} />}

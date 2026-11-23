@@ -125,10 +125,35 @@ export default function VehicleInspector({ caseId, vehicleId, vehicles, onOpenVe
                 ))}
               </div>
               {keyframe.plate_raw ? (
-                <div className="grid grid-cols-2 gap-2">
-                  <figure><figcaption className="label mb-0.5">Raw crop</figcaption><img src={artifactUrl(keyframe.plate_raw)} alt="Raw plate crop" className="h-14 w-full border border-line bg-slate-100 object-contain" /></figure>
-                  <figure><figcaption className="label mb-0.5">Enhanced for OCR</figcaption><img src={artifactUrl(keyframe.plate_enhanced)} alt="Enhanced plate crop" className="h-14 w-full border border-line bg-slate-100 object-contain" /></figure>
-                  <div className="num col-span-2 break-words text-2xs text-muted">OCR read {keyframe.plate_text} · {keyframe.ocr_source}</div>
+                <div className="space-y-2">
+                  <div className="grid grid-cols-2 gap-2">
+                    <figure><figcaption className="label mb-0.5">Raw crop (source)</figcaption><img src={artifactUrl(keyframe.plate_raw)} alt="Raw plate crop" className="h-14 w-full border border-line bg-slate-100 object-contain [image-rendering:pixelated]" /></figure>
+                    <figure><figcaption className="label mb-0.5">Enhanced view</figcaption><img src={artifactUrl(keyframe.plate_enhanced)} alt="Enhanced plate crop" className="h-14 w-full border border-line bg-slate-100 object-contain" /></figure>
+                  </div>
+                  <dl className="grid grid-cols-[minmax(0,auto)_minmax(0,1fr)] gap-x-2 text-2xs text-muted">
+                    <dt>Plate box</dt><dd className="num">{((keyframe.plate_box_confidence ?? 0) * 100).toFixed(0)}% · {keyframe.plate_crop_size?.join("×")} px</dd>
+                    <dt>Frame quality</dt><dd className="num">sharpness {keyframe.frame_sharpness?.toFixed(0)} · brightness {keyframe.brightness?.toFixed(0)}{keyframe.low_sharpness ? " · low sharpness" : ""}</dd>
+                    <dt>OCR engine</dt><dd className="num break-words">{keyframe.ocr_engine}</dd>
+                    <dt>Perspective</dt><dd>{keyframe.rectification?.reason ?? "not recorded"}</dd>
+                    <dt>Raw hash</dt><dd className="num truncate" title={keyframe.crop_sha256}>{keyframe.crop_sha256?.slice(0, 16)}…</dd>
+                  </dl>
+                  {keyframe.variants && (
+                    <details>
+                      <summary className="cursor-pointer text-xs font-medium">OCR by image variant <span className="num font-normal text-muted">{keyframe.variants.length}</span></summary>
+                      <ul className="mt-1 divide-y divide-line border border-line">
+                        {keyframe.variants.map((view) => (
+                          <li key={view.name} className="grid grid-cols-[88px_minmax(0,1fr)] items-center gap-2 p-1.5">
+                            <img src={artifactUrl(view.image)} alt={view.label} loading="lazy" className="h-8 w-[88px] border border-line bg-slate-100 object-contain" />
+                            <span className="min-w-0 text-2xs">
+                              <span className="block font-medium">{view.label} <span className="font-normal text-muted">· {view.kind}</span></span>
+                              <span className="num block truncate text-muted">{view.text || "no read"} · {(view.mean_confidence * 100).toFixed(0)}%</span>
+                            </span>
+                          </li>
+                        ))}
+                      </ul>
+                      <p className="mt-1 text-2xs text-muted">Only the raw crop is source evidence. Other views cannot establish a character alone.</p>
+                    </details>
+                  )}
                 </div>
               ) : <div className="border border-line px-2 py-1.5 text-2xs text-muted">No plate belonging to this vehicle was found in this frame.</div>}
               {fused.stack_crop && (
@@ -138,8 +163,8 @@ export default function VehicleInspector({ caseId, vehicleId, vehicles, onOpenVe
           ) : <Empty title="No keyframes stored" />}
           <dl className="grid grid-cols-[84px_minmax(0,1fr)] gap-x-2 gap-y-1 border-t border-line p-3 text-xs">
             <dt className="label">Colour</dt><dd>{vehicle.attributes.colours.map((c) => `${c.label} ${(c.confidence * 100).toFixed(0)}%`).join(", ") || "Unknown"}</dd>
-            <dt className="label">Body</dt><dd>{pretty(vehicle.attributes.body_type.label)}{vehicle.attributes.body_type.source?.includes("uncertain") ? " (fine type uncertain)" : ` ${(vehicle.attributes.body_type.confidence * 100).toFixed(0)}%`}</dd>
-            <dt className="label">Make/model</dt><dd>{model.status === "recognised" ? `Estimated ${model.predictions[0].make} ${model.predictions[0].model}` : "Not determined"}</dd>
+            <dt className="label">Body</dt><dd>{(vehicle.attributes.body_type.distribution?.length ? vehicle.attributes.body_type.distribution.slice(0, 2) : [vehicle.attributes.body_type]).map((b) => `${pretty(b.label)} ${(b.confidence * 100).toFixed(0)}%`).join(", ")}{vehicle.attributes.body_type.source?.includes("uncertain") ? " (fine type uncertain)" : ""}</dd>
+            <dt className="label">Make/model</dt><dd>{model.status === "recognised" ? `Estimated ${model.predictions[0].make} ${model.predictions[0].model}` : "Unknown"}</dd>
             <dt className="label">Tracked</dt><dd className="num">{vehicle.frames_tracked} frames{(vehicle.attributes.merged_track_ids?.length ?? 0) > 0 ? ` · ${vehicle.attributes.merged_track_ids!.length} fragment(s) merged` : ""}</dd>
           </dl>
           <p className="border-t border-line px-3 py-2 text-2xs text-muted">Attribute estimates are supporting evidence only and never identify a vehicle.</p>
@@ -147,7 +172,7 @@ export default function VehicleInspector({ caseId, vehicleId, vehicles, onOpenVe
 
         <section className="panel min-w-0">
           <div className="panel-head">Multi-frame plate recovery <span className="num font-normal text-muted">{fused.reads_used ?? 0} used · {fused.reads_rejected ?? 0} rejected</span></div>
-          {vehicle.plate_script === "non_latin" && (
+          {vehicle.plate_format === "non_latin_digits" && (
             <div className="border-b border-amber-200 bg-amber-50 px-3 py-1.5 text-2xs text-amber-900">This clip is marked non-Latin, so letters are withheld and only digits are used.</div>
           )}
           {fused.matrix.length ? (
@@ -178,11 +203,22 @@ export default function VehicleInspector({ caseId, vehicleId, vehicles, onOpenVe
           ) : <Empty title="No usable plate reads">No character is inferred when a plate cannot be read.</Empty>}
           {slot ? (
             <div className="border-t border-line px-3 py-2 text-2xs text-muted">
-              <div className="mb-1 font-semibold text-ink">Slot {slot.position + 1}: {slot.char === "?" ? "unknown" : slot.char} · fused {(slot.confidence * 100).toFixed(0)}% · {slot.support_frames} of {slot.observed_frames} frame(s) agree</div>
-              {slot.candidates.length > 0 && <div>Other readings: <span className="num">{slot.candidates.map((c) => `${c.char} ${(c.probability * 100).toFixed(0)}%`).join(", ")}</span></div>}
-              <div className="num mt-0.5 break-words">{(slot.evidence ?? []).map((v) => `${v.frame_idx < 0 ? "stack" : `f${v.frame_idx}`}:${v.char} ${(v.confidence * 100).toFixed(0)}%`).join("  ")}</div>
+              <div className="mb-1 font-semibold text-ink">Slot {slot.position + 1}: {slot.char === "?" ? "unknown" : slot.char} · fused {(slot.confidence * 100).toFixed(0)}% · {slot.support_frames} of {slot.observed_frames} frame(s) agree · {slot.source_supported_frames ?? 0} from source pixels</div>
+              {slot.unknown_reason && <div className="mb-1 text-amber-800">Unknown because {slot.unknown_reason}.</div>}
+              {slot.candidates.length > 0 && <div>Alternatives: <span className="num">{slot.candidates.map((c) => `${c.char} ${(c.probability * 100).toFixed(0)}%`).join(", ")}</span></div>}
+              <ul className="mt-1 max-h-52 divide-y divide-line overflow-y-auto border border-line">
+                {(slot.evidence ?? []).map((vote, index) => (
+                  <li key={`${vote.frame_idx}-${index}`} className="flex items-center gap-2 p-1">
+                    {vote.crop ? <img src={artifactUrl(vote.crop)} alt={`Raw crop from frame ${vote.frame_idx}`} loading="lazy" className="h-6 w-16 shrink-0 border border-line object-contain" /> : <span className="h-6 w-16 shrink-0 border border-line bg-canvas text-center leading-6">stack</span>}
+                    <span className="min-w-0">
+                      <span className="num block text-ink">{vote.frame_idx < 0 ? "stack" : `frame ${vote.frame_idx} · ${seconds(vote.timestamp_sec)}`} · {vote.char} {(vote.confidence * 100).toFixed(0)}%{vote.source_supported === false ? " · not in source" : ""}</span>
+                      {vote.variants && vote.variants.length > 0 && <span className="num block truncate">{vote.variants.map((v) => `${v.variant}:${v.char}`).join(" ")}</span>}
+                    </span>
+                  </li>
+                ))}
+              </ul>
             </div>
-          ) : fused.slots.length > 0 && <div className="border-t border-line px-3 py-1.5 text-2xs text-muted">Select a fused character to see which frames support it.</div>}
+          ) : fused.slots.length > 0 && <div className="border-t border-line px-3 py-1.5 text-2xs text-muted">Select a fused character to see its frames, crops, variants and alternatives.</div>}
           {rejected.length > 0 && (
             <details className="border-t border-line">
               <summary className="cursor-pointer px-3 py-2 text-xs font-medium">Rejected reads <span className="num font-normal text-muted">{rejected.length}</span></summary>

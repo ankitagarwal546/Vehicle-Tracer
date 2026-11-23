@@ -7,7 +7,7 @@ import type {
   MatchResult,
   MatchTestPayload,
   OverridePayload,
-  PlateScript,
+  PlateFormat,
   ReviewStatus,
   AuditEntry,
   RegistryVehicle,
@@ -42,7 +42,10 @@ export interface ClipUpload {
   camera_label: string;
   location: string;
   recorded_at: string;
-  plate_script: PlateScript;
+  timezone: string;
+  latitude: string;
+  longitude: string;
+  plate_format: PlateFormat;
 }
 
 export const api = {
@@ -56,12 +59,15 @@ export const api = {
       form.append("files", item.file);
       form.append("camera_label", item.camera_label);
       form.append("location", item.location);
-      form.append("recorded_at", item.recorded_at ? new Date(item.recorded_at).toISOString() : "");
-      form.append("plate_script", item.plate_script);
+      form.append("recorded_at", item.recorded_at);
+      form.append("timezone", item.recorded_at ? item.timezone : "");
+      form.append("latitude", item.latitude);
+      form.append("longitude", item.longitude);
+      form.append("plate_format", item.plate_format);
     }
     return request<{ clips: Clip[] }>(`/cases/${id}/clips`, { method: "POST", body: form });
   },
-  updateClip: (id: string, clipId: string, body: { recorded_at?: string | null; plate_script?: PlateScript }) =>
+  updateClip: (id: string, clipId: string, body: { recorded_at?: string | null; timezone?: string | null; plate_format?: PlateFormat }) =>
     request<Clip>(`/cases/${id}/clips/${clipId}`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
@@ -95,6 +101,12 @@ export const api = {
 };
 
 export const artifactUrl = (path?: string | null) => (path ? `/artifacts/${path}` : undefined);
-export const reportHtmlUrl = (id: string) => `/api/cases/${id}/report/html`;
-export const reportPdfUrl = (id: string, appendix = false) => `/api/cases/${id}/report/pdf${appendix ? "?appendix=true" : ""}`;
+export const reportHtmlUrl = (id: string, clipId?: string) => `/api/cases/${id}/report/html${clipId ? `?clip_id=${clipId}` : ""}`;
+export const reportPdfUrl = (id: string, appendix = false, clipId?: string) => {
+  const query = new URLSearchParams();
+  if (appendix) query.set("appendix", "true");
+  if (clipId) query.set("clip_id", clipId);
+  const suffix = query.toString();
+  return `/api/cases/${id}/report/pdf${suffix ? `?${suffix}` : ""}`;
+};
 export const progressUrl = (id: string) => `/api/cases/${id}/progress`;

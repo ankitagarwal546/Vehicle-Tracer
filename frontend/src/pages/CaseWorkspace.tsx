@@ -1,8 +1,8 @@
 import { AlertTriangle, Play, Search, Upload, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { api, artifactUrl, progressUrl, type ClipUpload } from "../api/client";
-import { Empty, LinkBadge, OUTCOMES, OUTCOME_ORDER, OutcomeBadge, Pagination, PlateText, pretty, score, seconds, shortHash, toLocalInput } from "../components/ui";
-import type { CaseDetail, Clip, Outcome, PlateScript, ProgressEvent, VehicleSummary } from "../types";
+import { api, artifactUrl, progressUrl, reportHtmlUrl, reportPdfUrl, type ClipUpload } from "../api/client";
+import { Badge, Empty, LinkBadge, OUTCOMES, OUTCOME_ORDER, OutcomeBadge, Pagination, PlateText, browserZone, pretty, score, seconds, shortHash, toZoneInput } from "../components/ui";
+import { PLATE_FORMATS, type CaseDetail, type Clip, type Outcome, type PlateFormat, type ProgressEvent, type VehicleSummary } from "../types";
 
 const ACCEPT = ".mp4,.avi,.mov,.mkv,.zip";
 const PAGE_SIZE = 20;
@@ -10,23 +10,31 @@ type Sort = "relevance" | "plate" | "first_seen" | "duration";
 
 interface Props {
   detail: CaseDetail | null;
+  loading: boolean;
   vehicles: VehicleSummary[];
   onRefresh: () => Promise<void>;
   onOpenVehicle: (id: string) => void;
   onError: (message: string) => void;
 }
 
-function ClipRow({ clip, caseId, disabled, onSaved, onError }: {
+const ZONES = ["UTC", "Asia/Kolkata", "Asia/Bangkok", "Europe/London", "Asia/Dubai", "America/New_York"];
+
+function ClipRow({ clip, caseId, hasResults, disabled, onSaved, onError }: {
   clip: Clip;
   caseId: string;
+  hasResults: boolean;
   disabled: boolean;
   onSaved: () => Promise<void>;
   onError: (message: string) => void;
 }) {
-  const [time, setTime] = useState(toLocalInput(clip.recorded_at));
-  useEffect(() => setTime(toLocalInput(clip.recorded_at)), [clip.recorded_at]);
+  const [zone, setZone] = useState(clip.timezone || browserZone());
+  const [time, setTime] = useState(toZoneInput(clip.recorded_at, clip.timezone));
+  useEffect(() => {
+    setZone(clip.timezone || browserZone());
+    setTime(toZoneInput(clip.recorded_at, clip.timezone));
+  }, [clip.recorded_at, clip.timezone]);
 
-  const save = async (body: { recorded_at?: string | null; plate_script?: PlateScript }) => {
+  const save = async (body: { recorded_at?: string | null; timezone?: string | null; plate_format?: PlateFormat }) => {
     try {
       await api.updateClip(caseId, clip.id, body);
       await onSaved();
@@ -34,32 +42,50 @@ function ClipRow({ clip, caseId, disabled, onSaved, onError }: {
       onError((error as Error).message);
     }
   };
+  const saveTime = () => {
+    if (time !== toZoneInput(clip.recorded_at, clip.timezone) || (time && zone !== clip.timezone)) {
+      void save(time ? { timezone: zone, recorded_at: time } : { recorded_at: null, timezone: null });
+    }
+  };
 
   return (
-    <tr>
-      <td className="td font-medium">{clip.camera_label}{clip.location && <div className="text-2xs font-normal text-muted">{clip.location}</div>}</td>
-      <td className="td max-w-[150px] truncate" title={clip.filename}>{clip.filename}</td>
-      <td className="td num text-2xs" title={clip.sha256}>{shortHash(clip.sha256)}</td>
-      <td className="td num whitespace-nowrap text-2xs">{clip.width}×{clip.height} · {clip.fps}fps · {clip.duration_sec}s</td>
-      <td className="td">
-        <input aria-label={`Capture time for ${clip.camera_label}`} type="datetime-local" disabled={disabled}
-          className={`field w-[172px] ${clip.recorded_at ? "" : "border-amber-300 bg-amber-50"}`} value={time}
-          onChange={(e) => setTime(e.target.value)}
-          onBlur={() => { if (time !== toLocalInput(clip.recorded_at)) void save({ recorded_at: time ? new Date(time).toISOString() : null }); }} />
-        {!clip.recorded_at && <div className="mt-0.5 text-2xs text-amber-800">Missing, time not validated</div>}
-      </td>
-      <td className="td">
-        <select aria-label={`Plate script for ${clip.camera_label}`} disabled={disabled} className="field w-[150px]" value={clip.plate_script}
-          onChange={(e) => void save({ plate_script: e.target.value as PlateScript })}>
-          <option value="latin">Latin A–Z, 0–9</option>
-          <option value="non_latin">Non-Latin, digits only</option>
+    <li className="grid gap-x-3 gap-y-2 border-b border-line p-3 last:border-b-0 md:grid-cols-2 xl:grid-cols-[minmax(0,1.3fr)_minmax(0,1.6fr)_minmax(0,1fr)_auto]">
+      <div className="min-w-0 text-xs">
+        <div className="flex flex-wrap items-center gap-1.5 font-medium">{clip.camera_label}{clip.synthetic && <Badge tone="amber">Synthetic fixture</Badge>}</div>
+        {clip.location && <div className="text-2xs text-muted">{clip.location}</div>}
+        <div className="truncate text-2xs text-muted" title={clip.filename}>{clip.filename}</div>
+        <div className="num text-2xs text-muted" title={clip.sha256}>SHA-256 {shortHash(clip.sha256)}</div>
+        <div className="num text-2xs text-muted">{clip.width}×{clip.height} · {clip.fps}fps · {clip.duration_sec}s · {clip.codec}</div>
+      </div>
+      <div className="min-w-0">
+        <span className="label">Capture time</span>
+        <div className="grid gap-1 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]">
+          <input aria-label={`Capture time for ${clip.camera_label}`} type="datetime-local" disabled={disabled}
+            className={`field ${clip.recorded_at ? "" : "border-amber-300 bg-amber-50"}`} value={time}
+            onChange={(e) => setTime(e.target.value)} onBlur={saveTime} />
+          <input aria-label={`Timezone for ${clip.camera_label}`} list="timezones" disabled={disabled} className="field" value={zone}
+            onChange={(e) => setZone(e.target.value)} onBlur={saveTime} />
+        </div>
+        {!clip.recorded_at && <div className="mt-0.5 text-2xs text-amber-800">Missing, temporal validation unavailable</div>}
+      </div>
+      <label className="block min-w-0">
+        <span className="label">Plate format</span>
+        <select aria-label={`Plate format for ${clip.camera_label}`} disabled={disabled} className="field" value={clip.plate_format}
+          onChange={(e) => void save({ plate_format: e.target.value as PlateFormat })}>
+          {PLATE_FORMATS.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}
         </select>
-      </td>
-    </tr>
+      </label>
+      {hasResults && (
+        <div className="flex flex-wrap items-end gap-1">
+          <a className="btn" href={reportHtmlUrl(caseId, clip.id)} target="_blank" rel="noreferrer">Clip HTML</a>
+          <a className="btn" href={reportPdfUrl(caseId, false, clip.id)}>Clip PDF</a>
+        </div>
+      )}
+    </li>
   );
 }
 
-export default function CaseWorkspace({ detail, vehicles, onRefresh, onOpenVehicle, onError }: Props) {
+export default function CaseWorkspace({ detail, loading, vehicles, onRefresh, onOpenVehicle, onError }: Props) {
   const [queue, setQueue] = useState<ClipUpload[]>([]);
   const [uploading, setUploading] = useState(false);
   const [dragging, setDragging] = useState(false);
@@ -68,6 +94,7 @@ export default function CaseWorkspace({ detail, vehicles, onRefresh, onOpenVehic
   const [outcome, setOutcome] = useState<Outcome | "ALL">("ALL");
   const [camera, setCamera] = useState("");
   const [linkFilter, setLinkFilter] = useState("");
+  const [readability, setReadability] = useState("");
   const [sort, setSort] = useState<Sort>("relevance");
   const [page, setPage] = useState(1);
   const input = useRef<HTMLInputElement>(null);
@@ -81,10 +108,11 @@ export default function CaseWorkspace({ detail, vehicles, onRefresh, onOpenVehic
     setOutcome("ALL");
     setCamera("");
     setLinkFilter("");
+    setReadability("");
     setPage(1);
   }, [caseId]);
 
-  useEffect(() => setPage(1), [query, outcome, camera, linkFilter, sort]);
+  useEffect(() => setPage(1), [query, outcome, camera, linkFilter, readability, sort]);
 
   useEffect(() => {
     if (!caseId || !active) return;
@@ -115,6 +143,7 @@ export default function CaseWorkspace({ detail, vehicles, onRefresh, onOpenVehic
     const list = vehicles.filter((vehicle) =>
       (outcome === "ALL" || vehicle.outcome === outcome)
       && (!camera || vehicle.camera_label === camera)
+      && (!readability || vehicle.readability === readability)
       && (!linkFilter || (linkFilter === "any" ? Boolean(vehicle.link_status) : vehicle.link_status === linkFilter))
       && (!needle || vehicle.plate.includes(needle) || (vehicle.top_plate ?? "").includes(needle)
         || `T${vehicle.track_id}` === needle || vehicle.camera_label.toUpperCase().includes(needle)));
@@ -126,7 +155,7 @@ export default function CaseWorkspace({ detail, vehicles, onRefresh, onOpenVehic
       return rank(a) - rank(b) || (b.top_score ?? 0) - (a.top_score ?? 0) || b.known_chars - a.known_chars
         || b.frames_tracked - a.frames_tracked;
     });
-  }, [vehicles, query, outcome, camera, linkFilter, sort]);
+  }, [vehicles, query, outcome, camera, linkFilter, readability, sort]);
 
   const pages = Math.max(Math.ceil(filtered.length / PAGE_SIZE), 1);
   const current = Math.min(page, pages);
@@ -141,7 +170,10 @@ export default function CaseWorkspace({ detail, vehicles, onRefresh, onOpenVehic
       camera_label: `Camera ${String.fromCharCode(65 + offset + index)}`,
       location: "",
       recorded_at: "",
-      plate_script: "latin",
+      timezone: browserZone(),
+      latitude: "",
+      longitude: "",
+      plate_format: "latin_any",
     }));
     setQueue((existing) => [...existing, ...added]);
   };
@@ -176,7 +208,12 @@ export default function CaseWorkspace({ detail, vehicles, onRefresh, onOpenVehic
   };
 
   if (!detail) {
-    return <div className="panel"><Empty title="No case selected">Create a case from the header to begin ingesting CCTV evidence.</Empty></div>;
+    return (
+      <div className="panel">
+        {loading ? <div role="status" className="px-4 py-8 text-center text-xs text-muted">Loading case…</div>
+          : <Empty title="No case selected">Create a case from the header to begin ingesting CCTV evidence.</Empty>}
+      </div>
+    );
   }
 
   const stats: { key: Outcome | "ALL"; label: string; value: number }[] = [
@@ -186,6 +223,7 @@ export default function CaseWorkspace({ detail, vehicles, onRefresh, onOpenVehic
 
   return (
     <div className="space-y-3">
+      <datalist id="timezones">{ZONES.map((zone) => <option key={zone} value={zone} />)}</datalist>
       {detail.stale && (
         <div role="status" className="flex flex-wrap items-center gap-2 border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-900">
           <AlertTriangle size={16} className="shrink-0" />
@@ -220,10 +258,14 @@ export default function CaseWorkspace({ detail, vehicles, onRefresh, onOpenVehic
                   <input aria-label="Camera label" className="field" placeholder="Camera label" value={item.camera_label} onChange={(e) => update(index, { camera_label: e.target.value })} />
                   <input aria-label="Location" className="field" placeholder="Location" value={item.location} onChange={(e) => update(index, { location: e.target.value })} />
                   <input aria-label="Recorded at" className="field" type="datetime-local" value={item.recorded_at} onChange={(e) => update(index, { recorded_at: e.target.value })} />
-                  <select aria-label="Plate script" className="field" value={item.plate_script} onChange={(e) => update(index, { plate_script: e.target.value as PlateScript })}>
-                    <option value="latin">Latin A–Z, 0–9</option>
-                    <option value="non_latin">Non-Latin, digits only</option>
+                  <input aria-label="Timezone" list="timezones" className="field" value={item.timezone} onChange={(e) => update(index, { timezone: e.target.value })} />
+                  <select aria-label="Plate format" className="field" value={item.plate_format} onChange={(e) => update(index, { plate_format: e.target.value as PlateFormat })}>
+                    {PLATE_FORMATS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
                   </select>
+                  <span className="grid grid-cols-2 gap-1">
+                    <input aria-label="Latitude" inputMode="decimal" className="field" placeholder="Latitude" value={item.latitude} onChange={(e) => update(index, { latitude: e.target.value })} />
+                    <input aria-label="Longitude" inputMode="decimal" className="field" placeholder="Longitude" value={item.longitude} onChange={(e) => update(index, { longitude: e.target.value })} />
+                  </span>
                 </div>
               </div>
             ))}
@@ -255,14 +297,12 @@ export default function CaseWorkspace({ detail, vehicles, onRefresh, onOpenVehic
           )}
           {detail.error && <div className="border-b border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-800">{detail.error}</div>}
           {detail.clips.length ? (
-            <div className="overflow-x-auto">
-              <table className="w-full min-w-[860px] border-collapse text-xs">
-                <thead><tr><th className="th">Camera</th><th className="th">File</th><th className="th">SHA-256</th><th className="th">Video</th><th className="th">Capture time</th><th className="th">Plate script</th></tr></thead>
-                <tbody>
-                  {detail.clips.map((clip) => <ClipRow key={clip.id} clip={clip} caseId={detail.id} disabled={active} onSaved={onRefresh} onError={onError} />)}
-                </tbody>
-              </table>
-            </div>
+            <>
+              <ul className="xl:max-h-[300px] xl:overflow-y-auto">
+                {detail.clips.map((clip) => <ClipRow key={clip.id} clip={clip} caseId={detail.id} hasResults={detail.status === "COMPLETED"} disabled={active} onSaved={onRefresh} onError={onError} />)}
+              </ul>
+              <p className="border-t border-line px-3 py-1.5 text-2xs text-muted">Changing a plate format applies on the next analysis run.</p>
+            </>
           ) : <Empty title="No evidence ingested">Each clip is hashed with SHA-256 on arrival.</Empty>}
         </section>
       </div>
@@ -283,9 +323,12 @@ export default function CaseWorkspace({ detail, vehicles, onRefresh, onOpenVehic
                 </button>
               ))}
             </div>
-            <div className="grid gap-2 border-b border-line p-2 sm:grid-cols-2 lg:grid-cols-[minmax(0,2fr)_1fr_1fr_1fr]">
+            <div className="grid gap-2 border-b border-line p-2 sm:grid-cols-2 lg:grid-cols-[minmax(0,2fr)_1fr_1fr_1fr_1fr]">
               <label className="relative"><Search size={16} className="absolute left-2 top-1.5 text-muted" /><input aria-label="Search results" className="field pl-7" placeholder="Search plate, camera or T12" value={query} onChange={(e) => setQuery(e.target.value)} /></label>
               <select aria-label="Filter camera" className="field" value={camera} onChange={(e) => setCamera(e.target.value)}><option value="">All cameras</option>{cameras.map((v) => <option key={v} value={v}>{v}</option>)}</select>
+              <select aria-label="Filter plate readability" className="field" value={readability} onChange={(e) => setReadability(e.target.value)}>
+                <option value="">Any readability</option><option value="comparable">5+ characters</option><option value="partial">1–4 characters</option><option value="none">No characters</option>
+              </select>
               <select aria-label="Filter links" className="field" value={linkFilter} onChange={(e) => setLinkFilter(e.target.value)}>
                 <option value="">Any link state</option><option value="any">Has a link</option><option value="proposed">Possible link</option><option value="confirmed">Confirmed link</option>
               </select>

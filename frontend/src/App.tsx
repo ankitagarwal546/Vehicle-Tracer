@@ -42,22 +42,36 @@ export default function App() {
   const [error, setError] = useState("");
   const [creating, setCreating] = useState(false);
   const [title, setTitle] = useState("");
+  const [loading, setLoading] = useState(Boolean(initial.current.caseId));
+  const [loadFailed, setLoadFailed] = useState(false);
 
   const refreshHealth = useCallback(() => api.health().then(setHealth).catch((e: Error) => setError(e.message)), []);
 
   const refresh = useCallback(async () => {
     try {
+      setLoadFailed(false);
       const list = await api.listCases();
       setCases(list);
+      if (caseId && !list.some((item) => item.id === caseId)) setError("That case link no longer exists. Showing the latest case.");
       const target = caseId && list.some((item) => item.id === caseId) ? caseId : list[0]?.id ?? null;
-      if (target !== caseId) setCaseId(target);
-      if (!target) return;
+      if (target !== caseId) {
+        setCaseId(target);
+        setVehicleId(null);
+        if (target) return;
+      }
+      if (!target) {
+        setLoading(false);
+        return;
+      }
       const [nextDetail, nextVehicles] = await Promise.all([api.getCase(target), api.vehicles(target)]);
       setDetail(nextDetail);
       setVehicles(nextVehicles.vehicles);
       setEntities(nextVehicles.entities);
+      setLoading(false);
     } catch (e) {
       setError((e as Error).message);
+      setLoadFailed(true);
+      setLoading(false);
     }
   }, [caseId]);
 
@@ -69,6 +83,7 @@ export default function App() {
   }, [caseId, view, vehicleId]);
 
   const selectCase = (id: string) => {
+    setLoading(true);
     setCaseId(id);
     setDetail(null);
     setVehicles([]);
@@ -142,6 +157,14 @@ export default function App() {
         </nav>
       </header>
 
+      {health?.models.assets && !health.models.assets.ready && (
+        <div role="alert" className="border-b border-amber-300 bg-amber-50 px-4 py-1.5 text-xs text-amber-900">
+          Analysis is unavailable. Missing {health.models.assets.missing.join(", ")}. From the backend folder, run <code className="num">{health.models.assets.install_command}</code>
+        </div>
+      )}
+      {health?.models.assets?.ready && !health.models.assets.attributes_reid.installed && (
+        <div role="status" className="border-b border-amber-300 bg-amber-50 px-4 py-1.5 text-xs text-amber-900">OpenCLIP weights are not installed, so make/model is Unknown and fine body type and visual link evidence are limited.</div>
+      )}
       {error && (
         <div role="alert" className="flex items-center justify-between gap-2 border-b border-rose-200 bg-rose-50 px-4 py-1.5 text-xs text-rose-800">
           <span>{error}</span><button aria-label="Dismiss error" onClick={() => setError("")}><X size={16} /></button>
@@ -150,12 +173,21 @@ export default function App() {
 
       <main className="min-w-0 flex-1 p-2 sm:p-4">
         <ErrorBoundary resetKey={`${caseId}-${view}-${vehicleId}`}>
-        {view === "case" && <CaseWorkspace detail={detail} vehicles={vehicles} onRefresh={refresh} onOpenVehicle={openVehicle} onError={setError} />}
+        {loadFailed && !detail ? (
+          <div role="alert" className="panel px-4 py-8 text-center">
+            <div className="text-xs font-semibold text-rose-800">Could not load this case</div>
+            <button className="btn mt-3" onClick={() => { setLoading(true); setError(""); void refresh(); }}>Retry</button>
+          </div>
+        ) : loading && !detail && view !== "registry" ? (
+          <div role="status" className="panel px-4 py-8 text-center text-xs text-muted">Loading case…</div>
+        ) : <>
+        {view === "case" && <CaseWorkspace detail={detail} loading={loading} vehicles={vehicles} onRefresh={refresh} onOpenVehicle={openVehicle} onError={setError} />}
         {view === "inspector" && (caseId
           ? <VehicleInspector caseId={caseId} vehicleId={vehicleId ?? ordered[0]?.id ?? null} vehicles={ordered} onOpenVehicle={openVehicle} onBack={() => setView("case")} onChanged={refresh} onError={setError} />
           : <div className="panel p-6 text-center text-xs text-muted">Create a case first.</div>)}
         {view === "trace" && <Traceability caseId={caseId} entities={entities} clipCount={detail?.clips.length ?? 0} onOpenVehicle={openVehicle} onChanged={refresh} onError={setError} />}
         {view === "registry" && <RegistryManager onError={setError} onRegistryChanged={refreshHealth} />}
+        </>}
         </ErrorBoundary>
       </main>
     </div>

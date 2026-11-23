@@ -2,6 +2,7 @@ export type MatchStatus = "CONFIDENT_SHORTLIST" | "NO_CONFIDENT_MATCH";
 export type Outcome = "PLATE_CANDIDATE" | "AMBIGUOUS" | "NO_REGISTRY_MATCH" | "INSUFFICIENT_PLATE" | "UNREADABLE_PLATE";
 export type ReviewStatus = "proposed" | "confirmed" | "rejected";
 export type PlateScript = "latin" | "non_latin";
+export type PlateFormat = "latin_any" | "india_rto" | "uk" | "non_latin_digits";
 export type SlotKind = "exact" | "confusable" | "unknown" | "mismatch" | "hard_mismatch" | "unobserved";
 
 export interface Clip {
@@ -20,6 +21,11 @@ export interface Clip {
   frame_count: number;
   codec: string;
   plate_script: PlateScript;
+  plate_format: PlateFormat;
+  timezone: string | null;
+  latitude: number | null;
+  longitude: number | null;
+  synthetic: boolean;
   processing: Record<string, number>;
 }
 
@@ -144,7 +150,23 @@ export interface FusedSlot {
   candidates: { char: string; probability: number }[];
   support_frames: number;
   observed_frames: number;
-  evidence?: { frame_idx: number; timestamp_sec: number; char: string; confidence: number; source: string }[];
+  source_supported_frames?: number;
+  unknown_reason?: string | null;
+  evidence?: SlotVote[];
+}
+
+export interface SlotVote {
+  frame_idx: number;
+  timestamp_sec: number;
+  char: string;
+  confidence: number;
+  source: string;
+  source_supported?: boolean;
+  ocr_engine?: string;
+  crop?: string | null;
+  crop_sha256?: string | null;
+  alternatives?: { char: string; probability: number }[];
+  variants?: { variant: string; char: string; confidence: number }[];
 }
 
 export interface MatrixRow {
@@ -170,7 +192,7 @@ export interface FusedPlate {
 
 export interface VehicleAttributes {
   colours: { label: string; confidence: number }[];
-  body_type: { label: string; confidence: number; source?: string };
+  body_type: { label: string; confidence: number; source?: string; distribution?: { label: string; confidence: number }[] };
   make_model: {
     status: string;
     predictions: { make: string; model: string; confidence: number }[];
@@ -204,6 +226,8 @@ export interface VehicleSummary {
   overridden: boolean;
   link_status: ReviewStatus | null;
   plate_script: PlateScript;
+  plate_format: PlateFormat;
+  readability: "none" | "partial" | "comparable";
 }
 
 export interface Keyframe {
@@ -216,6 +240,16 @@ export interface Keyframe {
   plate_enhanced?: string;
   plate_text?: string;
   plate_quality?: number;
+  frame_sharpness?: number;
+  brightness?: number;
+  contrast?: number;
+  low_sharpness?: boolean;
+  plate_box_confidence?: number;
+  plate_crop_size?: [number, number];
+  crop_sha256?: string;
+  ocr_engine?: string;
+  rectification?: { status: string; reason: string };
+  variants?: { name: string; label: string; kind: string; image: string; text: string; mean_confidence: number }[];
   ocr_source?: string;
 }
 
@@ -259,6 +293,7 @@ export interface TimelineEntry {
   clip_id: string;
   camera_label: string;
   location: string | null;
+  timezone?: string | null;
   first_seen_sec: number;
   last_seen_sec: number;
   absolute_time: string | null;
@@ -284,7 +319,13 @@ export interface Health {
   pipeline_version: string;
   registry_count: number;
   synthetic_count: number;
-  models: { device: string; plate_ocr: { engine: string | null }; clip: { loaded: boolean }; detector: { loaded: boolean } };
+  models: {
+    device: string;
+    plate_ocr: { engine: string | null };
+    clip: { loaded: boolean };
+    detector: { loaded: boolean };
+    assets: { ready: boolean; missing: string[]; install_command: string; attributes_reid: { installed: boolean } };
+  };
 }
 
 export interface ProgressEvent {
@@ -305,12 +346,20 @@ export interface OverridePayload {
 export interface MatchTestPayload {
   plate: string;
   plate_confidence: number;
+  plate_format?: PlateFormat;
   colour?: string;
   body_type?: string;
   body_confidence: number;
   make?: string;
   model?: string;
 }
+
+export const PLATE_FORMATS: { value: PlateFormat; label: string }[] = [
+  { value: "latin_any", label: "Latin A–Z, 0–9" },
+  { value: "india_rto", label: "India RTO / BH" },
+  { value: "uk", label: "UK" },
+  { value: "non_latin_digits", label: "Non-Latin, digits only" },
+];
 
 export const COLOURS = ["white", "silver", "grey", "black", "red", "maroon", "blue", "green", "yellow", "orange", "brown", "beige"];
 export const BODY_TYPES = ["sedan", "hatchback", "suv", "two-wheeler", "auto-rickshaw", "pickup_truck", "heavy_truck", "bus", "van"];

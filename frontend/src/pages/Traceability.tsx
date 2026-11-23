@@ -2,14 +2,13 @@ import { Check, RotateCcw, X } from "lucide-react";
 import { useMemo, useState } from "react";
 import { api, artifactUrl } from "../api/client";
 import { Shortlist } from "../components/Shortlist";
-import { Badge, Empty, PlateText, seconds, type Tone } from "../components/ui";
+import { Badge, Empty, PlateText, formatInZone, seconds, type Tone } from "../components/ui";
 import type { Entity, EntityLink, ReviewStatus } from "../types";
 
 const fmt = (value: number | null) => (value === null ? "n/a" : value.toFixed(2));
 const TIERS: Record<string, string> = {
   strong_plate: "Consistent plate characters",
   partial_plate: "Partial plate plus visual similarity",
-  visual_time: "Strong visual similarity with plausible time",
   legacy_unverified: "Older analysis, re-run required",
 };
 const STATUS: Record<ReviewStatus, { label: string; tone: Tone }> = {
@@ -59,7 +58,7 @@ export default function Traceability({ caseId, entities, clipCount, onOpenVehicl
       <div className="panel">
         <Empty title="No possible cross-camera links">
           {clipCount < 2 ? "Add at least two clips to trace a vehicle across cameras."
-            : "No pair of tracks had consistent plate characters, or strong visual evidence with a plausible capture time. Similar colour, body type or model alone never creates a link."}
+            : "No pair of tracks had compatible plate characters corroborated by visual or time evidence. Similar colour, body type or model alone never creates a link."}
         </Empty>
       </div>
     );
@@ -97,7 +96,7 @@ export default function Traceability({ caseId, entities, clipCount, onOpenVehicl
                         <span className="h-16 w-24 shrink-0 bg-slate-100 sm:h-20 sm:w-28">{stop.best_crop && <img src={artifactUrl(stop.best_crop)} alt={`Sighting at ${stop.camera_label}`} className="h-full w-full object-cover" />}</span>
                         <span className="min-w-0 space-y-1">
                           <span className="block text-xs font-semibold">{stop.camera_label}{stop.location ? ` · ${stop.location}` : ""}</span>
-                          <span className={`num block text-2xs ${stop.absolute_time ? "text-muted" : "text-amber-800"}`}>{stop.absolute_time ? new Date(stop.absolute_time).toLocaleString() : "Capture time missing"} · clip {seconds(stop.first_seen_sec)}–{seconds(stop.last_seen_sec)}</span>
+                          <span className={`num block text-2xs ${stop.absolute_time ? "text-muted" : "text-amber-800"}`}>{stop.absolute_time ? formatInZone(stop.absolute_time, stop.timezone) : "Capture time missing"} · clip {seconds(stop.first_seen_sec)}–{seconds(stop.last_seen_sec)}</span>
                           <span className="flex flex-wrap items-center gap-2"><span className="label">Plate read</span><PlateText text={stop.plate} size="sm" /></span>
                         </span>
                       </button>
@@ -115,7 +114,7 @@ export default function Traceability({ caseId, entities, clipCount, onOpenVehicl
                           <td className="td num">{link.plate_contradictions ?? 0}</td>
                           <td className="td num">{fmt(link.visual)}</td>
                           <td className="td num">{fmt(link.attributes)}</td>
-                          <td className="td"><Badge tone={temporal.tone}>{temporal.label}</Badge><div className="mt-0.5 text-2xs text-muted">{link.temporal_note}</div></td>
+                          <td className="td"><Badge tone={temporal.tone}>{temporal.label}</Badge><div className="mt-0.5 text-2xs text-muted">{link.temporal_note}</div><div className="text-2xs text-muted">{link.location_context}</div></td>
                         </tr>
                       );
                     })}</tbody>

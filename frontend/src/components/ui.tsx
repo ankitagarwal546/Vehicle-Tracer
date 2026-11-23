@@ -109,8 +109,27 @@ export const score = (value: number | null | undefined) => (value == null ? "n/a
 export const seconds = (value: number) => `${value.toFixed(2)}s`;
 export const shortHash = (hash: string) => `${hash.slice(0, 10)}…${hash.slice(-6)}`;
 export const pretty = (value: string) => value.replaceAll("_", " ");
-export const toLocalInput = (iso: string | null) => {
+export const browserZone = () => Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+
+/** Format a stored UTC instant for a datetime-local input in the camera's own timezone. */
+export const toZoneInput = (iso: string | null, zone: string | null) => {
   if (!iso) return "";
-  const date = new Date(iso);
-  return new Date(date.getTime() - date.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
+  try {
+    return new Intl.DateTimeFormat("sv-SE", {
+      timeZone: zone || browserZone(), year: "numeric", month: "2-digit", day: "2-digit",
+      hour: "2-digit", minute: "2-digit", hourCycle: "h23",
+    }).format(new Date(iso)).replace(" ", "T");
+  } catch {
+    return iso.slice(0, 16);
+  }
+};
+
+export const formatInZone = (iso: string, zone?: string | null) => {
+  try {
+    return new Intl.DateTimeFormat(undefined, {
+      timeZone: zone || undefined, dateStyle: "medium", timeStyle: "short",
+    }).format(new Date(iso)) + (zone ? ` ${zone}` : "");
+  } catch {
+    return new Date(iso).toLocaleString();
+  }
 };
