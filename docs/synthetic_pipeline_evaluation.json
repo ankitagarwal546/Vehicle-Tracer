@@ -1,0 +1,102 @@
+{
+  "seed": 20261127,
+  "data": "labelled synthetic video fixtures, not real CCTV",
+  "single_sighting_cases": 66,
+  "cross_camera_sightings": 20,
+  "top1_accuracy": 0.9348,
+  "top5_recall": 0.9783,
+  "mrr": 0.9529,
+  "rankable_cases": 46,
+  "no_match_precision": 0.8571,
+  "no_match_recall": 1.0,
+  "promoted": 31,
+  "wrong_promotions": [],
+  "emitted_characters": 642,
+  "wrong_emitted_characters": 6,
+  "character_precision": 0.9907,
+  "characters_emitted_on_hidden_slots": 2,
+  "link_precision": 0.8,
+  "link_recall": 0.8,
+  "links_proposed": 10,
+  "true_link_pairs": 10,
+  "negative_link_pairs": 180,
+  "by_category": {
+    "ambiguous_partial": {
+      "cases": 10,
+      "outcomes": {
+        "AMBIGUOUS": 10
+      }
+    },
+    "out_of_registry": {
+      "cases": 10,
+      "outcomes": {
+        "NO_REGISTRY_MATCH": 10
+      }
+    },
+    "true_clear": {
+      "cases": 15,
+      "outcomes": {
+        "PLATE_CANDIDATE": 15
+      }
+    },
+    "true_moving_occlusion": {
+      "cases": 6,
+      "outcomes": {
+        "PLATE_CANDIDATE": 3,
+        "NO_REGISTRY_MATCH": 2,
+        "INSUFFICIENT_PLATE": 1
+      }
+    },
+    "true_partial": {
+      "cases": 15,
+      "outcomes": {
+        "PLATE_CANDIDATE": 13,
+        "NO_REGISTRY_MATCH": 2
+      }
+    },
+    "unreadable": {
+      "cases": 10,
+      "outcomes": {
+        "UNREADABLE_PLATE": 10
+      }
+    }
+  },
+  "failures": [
+    {
+      "id": "partial1",
+      "category": "true_partial",
+      "truth": "UP16RX4569",
+      "read": "UP16RX5699",
+      "outcome": "NO_REGISTRY_MATCH"
+    },
+    {
+      "id": "partial8",
+      "category": "true_partial",
+      "truth": "TN22TN9572",
+      "read": "TN22N95572",
+      "outcome": "NO_REGISTRY_MATCH"
+    },
+    {
+      "id": "moving2",
+      "category": "true_moving_occlusion",
+      "truth": "HR10TM6224",
+      "read": "HR10M62224",
+      "outcome": "NO_REGISTRY_MATCH"
+    },
+    {
+      "id": "moving4",
+      "category": "true_moving_occlusion",
+      "truth": "MH01EV4234",
+      "read": "??01V4?2??",
+      "outcome": "NO_REGISTRY_MATCH"
+    },
+    {
+      "id": "moving5",
+      "category": "true_moving_occlusion",
+      "truth": "TN09HE4146",
+      "read": "????E41?6",
+      "outcome": "INSUFFICIENT_PLATE"
+    }
+  ],
+  "elapsed_sec": 249.5
+}
