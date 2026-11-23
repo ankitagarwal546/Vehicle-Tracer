@@ -94,6 +94,29 @@ def plate_format(plate: str) -> str | None:
     return None
 
 
+PLATE_FORMAT_OPTIONS = ("latin_any", "india_rto", "uk", "non_latin_digits")
+_UK_PLATE = re.compile(r"^[A-Z]{2}[0-9]{2}[A-Z]{3}$")
+_INDIA_PLATE = re.compile(r"^(?:[A-Z]{2}[0-9A-Z]{6,8}|[0-9]{2}BH[0-9A-Z]{4,6})$")
+
+
+def plate_family(plate: str) -> str:
+    """Broad format family of a registry plate, tolerant of the registry's OCR-lookalike entries."""
+    if _UK_PLATE.match(plate):
+        return "uk"
+    if _INDIA_PLATE.match(plate):
+        return "india_rto"
+    return "other"
+
+
+def format_accepts(plate_format: str, family: str) -> bool:
+    """Whether a registry family can be compared with reads from a camera's plate format."""
+    if plate_format == "latin_any":
+        return True
+    if plate_format == "non_latin_digits":
+        return family == "other"
+    return plate_format == family
+
+
 def expected_char_classes(plate: str) -> str:
     """Return one class per slot: ``A`` for a letter and ``9`` for a digit."""
     return "".join("9" if char.isdigit() else "A" for char in plate)

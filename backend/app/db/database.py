@@ -47,7 +47,13 @@ def _add_missing_columns() -> None:
     """Upgrade databases created by an earlier release without losing cases."""
     additions = {
         "registry_vehicles": {"source": "VARCHAR(16) NOT NULL DEFAULT 'synthetic'"},
-        "clips": {"plate_script": "VARCHAR(16) NOT NULL DEFAULT 'latin'"},
+        "clips": {
+            "plate_script": "VARCHAR(16) NOT NULL DEFAULT 'latin'",
+            "plate_format": "VARCHAR(24) NOT NULL DEFAULT 'latin_any'",
+            "timezone": "VARCHAR(64)",
+            "latitude": "FLOAT",
+            "longitude": "FLOAT",
+        },
         "cross_camera_entities": {
             "review_status": "VARCHAR(16) NOT NULL DEFAULT 'proposed'",
             "evidence_tier": "VARCHAR(32) NOT NULL DEFAULT 'legacy_unverified'",
@@ -63,3 +69,6 @@ def _add_missing_columns() -> None:
             for name, definition in columns.items():
                 if name not in existing:
                     connection.execute(text(f'ALTER TABLE {table} ADD COLUMN {name} {definition}'))
+                    if (table, name) == ("clips", "plate_format"):
+                        connection.execute(text("UPDATE clips SET plate_format = 'non_latin_digits' "
+                                                "WHERE plate_script = 'non_latin'"))

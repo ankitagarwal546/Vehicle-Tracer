@@ -183,3 +183,42 @@ def test_matrices():
     assert colour_similarity("white", "black") == 0.05
     assert body_similarity("sedan", "hatchback") == 0.60
     assert body_similarity("two-wheeler", "sedan") == 0.0
+
+
+def test_format_mismatch_is_an_explicit_no_match(registry):
+    evidence = query("QA15ZZK", colour="grey", body="hatchback")
+    evidence.plate_format = "uk"
+    result = match(evidence, registry)
+    assert result.outcome == "NO_REGISTRY_MATCH" and result.reason_codes == ["FORMAT_NOT_IN_REGISTRY"]
+    assert result.candidates == [] and result.rejected_candidates == []
+
+
+def test_uk_plate_can_match_uk_registry_row():
+    records = [RegistryRecord(plate="QA15ZZK", body_type="hatchback", colour="grey"),
+               RegistryRecord(plate="MH12DE1433", body_type="hatchback", colour="grey")]
+    evidence = query("QA15ZZK", colour="grey", body="hatchback")
+    evidence.plate_format = "uk"
+    result = match(evidence, records)
+    assert result.status == "CONFIDENT_SHORTLIST" and [c.vehicle.plate for c in result.candidates] == ["QA15ZZK"]
+
+
+def test_at_most_five_ranked_candidates(registry):
+    result = match(query("MH12DE1433"), registry)
+    assert len(result.candidates) + len(result.rejected_candidates) <= 5
+
+
+def test_dropped_covered_character_is_compared_as_unknown():
+    records = [RegistryRecord(plate="UP16RX4569", body_type="bus", colour="blue"),
+               RegistryRecord(plate="MH12DE1433", body_type="bus", colour="blue")]
+    result = match(query("UP16R4569", colour="blue", body="bus"), records)
+    assert result.status == "CONFIDENT_SHORTLIST"
+    top = result.candidates[0]
+    assert top.vehicle.plate == "UP16RX4569" and top.exact_chars == 9
+    assert [d.kind for d in top.slot_diff].count("unobserved") == 1
+
+
+def test_dropped_character_cannot_hide_a_plate_rival():
+    records = [RegistryRecord(plate="UP16RX4569", body_type="bus", colour="blue"),
+               RegistryRecord(plate="UP16RY4569", body_type="bus", colour="blue")]
+    result = match(query("UP16R4569", colour="blue", body="bus"), records)
+    assert result.outcome == "AMBIGUOUS" and result.candidates == []

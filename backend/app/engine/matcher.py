@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Iterable
+from itertools import combinations
 from math import ceil
 
 import numpy as np
@@ -23,8 +24,10 @@ from .confusion_matrices import (
     body_similarity,
     colour_similarity,
     expected_char_classes,
+    format_accepts,
     is_confusable,
     normalise_body,
+    plate_family,
 )
 from .schemas import (
     AttributeSuggestions,
@@ -46,6 +49,9 @@ HARD_MISMATCH_PENALTY = -1.2
 SOFT_MISMATCH_PENALTY = -0.40
 HARD_CONFIDENCE = 0.80
 SHIFT_PENALTY = 0.05
+DROPPED_SLOT_PENALTY = 0.05
+MAX_DROPPED_SLOTS = 2
+MIN_SLOTS_FOR_GAPS = 6
 
 WEIGHTS = {
     "high_readability": {"plate": 0.62, "body_type": 0.15, "colour": 0.13, "make_model": 0.10},
@@ -114,31 +120,58 @@ def _offsets(plate: PlateEvidence, registry_len: int) -> list[int]:
         return [registry_len - query_len]
     if plate.anchor == "full":
         return [0] if query_len == registry_len else [0, registry_len - query_len]
-    return list(range(min(0, registry_len - query_len), max(0, registry_len - query_len) + 1))
+    known = [index for index, slot in enumerate(plate.slots) if slot.char != "?"]
+    if not known:
+        return [0]
+    # Unknown edge slots carry no position evidence, so only the readable span must fit.
+    return list(range(-known[0], registry_len - known[-1]))
 
 
-def _align_plate(plate: PlateEvidence, registry_plate: str) -> tuple[float, float, int]:
-    """Return ``(quality, gamma, offset)`` for the best slot alignment."""
-    known_slots = [(index, slot) for index, slot in enumerate(plate.slots) if slot.char != "?"]
+def _layouts(plate: PlateEvidence, length: int) -> list[tuple[dict[int, int], float]]:
+    """Return ``(registry position -> slot index, penalty)`` candidates.
+
+    OCR can silently drop a covered character, shifting everything after it. A short read may
+    therefore be compared with one or two *unknown* slots inserted. Nothing is filled in.
+    """
+    count = len(plate.slots)
+    layouts: list[tuple[dict[int, int], float]] = []
+    for offset in _offsets(plate, length):
+        penalty = SHIFT_PENALTY if offset and plate.anchor == "full" else 0.0
+        layouts.append(({index + offset: index for index in range(count)}, penalty))
+    missing = length - count
+    if plate.anchor in {"full", "floating"} and 1 <= missing <= MAX_DROPPED_SLOTS and count >= MIN_SLOTS_FOR_GAPS:
+        for gaps in combinations(range(1, length - 1), missing):
+            remaining = iter(range(count))
+            mapping = {position: next(remaining) for position in range(length) if position not in gaps}
+            layouts.append((mapping, DROPPED_SLOT_PENALTY * missing))
+    return layouts
+
+
+def _align_plate(plate: PlateEvidence, registry_plate: str) -> tuple[float, float, dict[int, int]]:
+    """Return ``(quality, gamma, registry position -> slot index)`` for the best alignment."""
+    known_slots = {index: slot for index, slot in enumerate(plate.slots) if slot.char != "?"}
     if not known_slots:
-        return 0.0, 0.0, 0
+        return 0.0, 0.0, {}
     length = len(registry_plate)
     classes = expected_char_classes(registry_plate)
-    total_conf = sum(slot.confidence for _, slot in known_slots) or 1.0
+    total_conf = sum(slot.confidence for slot in known_slots.values()) or 1.0
     gamma = min(len(known_slots) / max(length, 1), 1.0)
-    best_quality, best_offset = float("-inf"), 0
-    for offset in _offsets(plate, length):
+    best_quality, best_mapping = float("-inf"), {}
+    for mapping, penalty in _layouts(plate, length):
         total = 0.0
-        for index, slot in known_slots:
-            position = index + offset
+        placed: set[int] = set()
+        for position, index in mapping.items():
+            if index not in known_slots:
+                continue
+            placed.add(index)
             if 0 <= position < length:
-                total += _score_slot(slot, registry_plate[position], classes[position])[1]
+                total += _score_slot(known_slots[index], registry_plate[position], classes[position])[1]
             else:
-                total += SOFT_MISMATCH_PENALTY * slot.confidence
-        quality = total / total_conf - (SHIFT_PENALTY if offset and plate.anchor == "full" else 0.0)
+                total += SOFT_MISMATCH_PENALTY * known_slots[index].confidence
+        quality = total / total_conf - penalty
         if quality > best_quality:
-            best_quality, best_offset = quality, offset
-    return max(0.0, min(1.0, best_quality)), gamma, best_offset
+            best_quality, best_mapping = quality, mapping
+    return max(0.0, min(1.0, best_quality)), gamma, best_mapping
 
 
 def score_plate(plate: PlateEvidence, registry_plate: str) -> tuple[float, float, float, int, int, list[SlotDiff]]:
@@ -152,12 +185,13 @@ def score_plate(plate: PlateEvidence, registry_plate: str) -> tuple[float, float
 
     classes = expected_char_classes(registry_plate)
     slots = plate.slots
-    quality, gamma, offset = _align_plate(plate, registry_plate)
-    by_position = {index + offset: slot for index, slot in enumerate(slots)}
+    quality, gamma, mapping = _align_plate(plate, registry_plate)
+    offset = next((position - index for position, index in sorted(mapping.items())), 0)
     diff: list[SlotDiff] = []
     hard = 0
     for position, registry_char in enumerate(registry_plate):
-        slot = by_position.get(position)
+        index = mapping.get(position)
+        slot = slots[index] if index is not None else None
         if slot is None:
             diff.append(SlotDiff(position=position, query="?", registry=registry_char, kind="unobserved",
                                  confidence=0.0, contribution=0.0))
@@ -221,6 +255,14 @@ class RegistryIndex:
         self.colours, self.colour_codes = self._encode(r.colour for r in self.records)
         self.bodies, self.body_codes = self._encode(r.body_type for r in self.records)
         self.make_models, self.make_model_codes = self._encode((r.make, r.model) for r in self.records)
+        self.families, self.family_codes = self._encode(plate_family(r.plate) for r in self.records)
+
+    def eligible(self, plate_format: str) -> np.ndarray:
+        """Registry rows whose plate format can be compared with this camera's plates."""
+        if not self.records:
+            return np.zeros(0, dtype=bool)
+        return np.asarray([format_accepts(plate_format, family) for family in self.families],
+                          dtype=bool)[self.family_codes]
 
     @staticmethod
     def _encode(values: Iterable) -> tuple[list, np.ndarray]:
@@ -242,18 +284,20 @@ def _plate_scores(index: RegistryIndex, plate: PlateEvidence) -> np.ndarray:
             char = chr(code)
             table[code] = _score_slot(slot, char, "9" if char.isdigit() else "A")[1]
         tables.append(table)
+    table_by_slot = {slot_index: table for (slot_index, _), table in zip(known_slots, tables)}
+    slot_by_index = dict(known_slots)
     for length, (indices, chars) in index.groups.items():
         best = np.full(len(indices), -np.inf)
-        for offset in _offsets(plate, length):
+        for mapping, penalty in _layouts(plate, length):
             total = np.zeros(len(indices), dtype=np.float64)
-            for (slot_index, slot), table in zip(known_slots, tables):
-                position = slot_index + offset
+            for position, slot_index in mapping.items():
+                if slot_index not in table_by_slot:
+                    continue
                 if 0 <= position < length:
-                    total += table[chars[:, position]]
+                    total += table_by_slot[slot_index][chars[:, position]]
                 else:
-                    total += SOFT_MISMATCH_PENALTY * slot.confidence
-            quality = total / total_conf - (SHIFT_PENALTY if offset and plate.anchor == "full" else 0.0)
-            best = np.maximum(best, quality)
+                    total += SOFT_MISMATCH_PENALTY * slot_by_index[slot_index].confidence
+            best = np.maximum(best, total / total_conf - penalty)
         scores[indices] = np.clip(best, 0.0, 1.0) * min(len(known_slots) / length, 1.0)
     return scores
 
@@ -362,11 +406,11 @@ def _build_candidate(query: QueryEvidence, record: RegistryRecord, regime: str, 
 
 
 def _suggestions(index: RegistryIndex, query: QueryEvidence, colour: np.ndarray | None,
-                 body: np.ndarray | None) -> AttributeSuggestions:
+                 body: np.ndarray | None, eligible: np.ndarray) -> AttributeSuggestions:
     """Unranked, alphabetical appearance matches. Owner details are withheld."""
     if colour is None and body is None:
         return AttributeSuggestions()
-    mask = np.ones(len(index.records), dtype=bool)
+    mask = eligible.copy()
     basis: list[str] = []
     if colour is not None:
         mask &= colour >= MIN_SUGGESTION_SIMILARITY
@@ -398,7 +442,9 @@ def match(
                          lambda value: score_make_model(query, value[0], value[1]))
     weights = _resolved_weights(regime, {"colour": colour is not None, "body_type": body is not None,
                                          "make_model": make_model is not None})
+    eligible = index.eligible(query.plate_format)
     plate_scores = _plate_scores(index, query.plate)
+    plate_scores = np.where(eligible, plate_scores, 0.0)
     raw = weights["plate"] * plate_scores
     for key, column in (("colour", colour), ("body_type", body), ("make_model", make_model)):
         if column is not None:
@@ -410,11 +456,11 @@ def match(
 
     # Plate evidence ranks first. Attributes only order vehicles whose plate evidence is tied.
     head: list[Candidate] = []
-    if records:
-        take = min(top_k + 1, len(records))
+    if bool(eligible.any()):
+        take = min(top_k + 1, int(eligible.sum()))
         rounded_plate = np.round(plate_scores, 4)
-        floor = np.partition(rounded_plate, -take)[-take]
-        pool = np.flatnonzero(rounded_plate >= floor)
+        floor = np.partition(rounded_plate[eligible], -take)[-take]
+        pool = np.flatnonzero((rounded_plate >= floor) & eligible)
         ordered = sorted(pool.tolist(), key=lambda i: (-rounded_plate[i], -scores[i], records[i].plate))
         for i in ordered[:take]:
             head.append(_build_candidate(
@@ -436,7 +482,7 @@ def match(
     outcome = "NO_REGISTRY_MATCH"
     top = shortlist[0] if shortlist else None
 
-    if top is None:
+    if not records:
         codes.append("EMPTY_REGISTRY")
         diagnostics.append("The registry is empty.")
     elif known == 0:
@@ -449,6 +495,11 @@ def match(
         codes.append("TOO_FEW_CHARACTERS")
         diagnostics.append(f"Only {known} plate character(s) are readable; at least "
                            f"{t['min_readable_chars']:.0f} are required before a vehicle can be shortlisted.")
+    elif top is None:
+        codes.append("FORMAT_NOT_IN_REGISTRY")
+        label = query.plate_format.replace("_", " ")
+        diagnostics.append(f"The registry contains no plates in this camera's format ({label}), so this read "
+                           "cannot match any registry vehicle.")
     else:
         if query.body_type and query.body_confidence > 0 and body is not None \
                 and bool(np.all(body < MIN_BODY_COMPATIBILITY)):
@@ -487,11 +538,11 @@ def match(
             c.model_copy(update={"vehicle": c.vehicle.without_owner(), "rank": rank})
             for rank, c in enumerate((c for c in shortlist if c.exact_chars >= required), start=1)
         ]
-        if outcome == "NO_REGISTRY_MATCH" and not keep and known >= t["min_readable_chars"]:
+        if outcome == "NO_REGISTRY_MATCH" and not keep and known >= t["min_readable_chars"] and top is not None:
             diagnostics = [f"No registry plate shares at least {required} characters with this read."]
             codes = ["NO_SIMILAR_PLATE"]
             base["reason_codes"] = codes
-        suggestions = _suggestions(index, query, colour, body) if known < t["min_readable_chars"] \
+        suggestions = _suggestions(index, query, colour, body, eligible) if known < t["min_readable_chars"] \
             else AttributeSuggestions()
         return MatchResult(status="NO_CONFIDENT_MATCH", outcome=outcome, candidates=[], rejected_candidates=keep,
                            attribute_suggestions=suggestions, diagnostics=diagnostics,

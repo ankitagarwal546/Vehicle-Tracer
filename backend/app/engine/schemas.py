@@ -66,6 +66,7 @@ class QueryEvidence(BaseModel):
     body_type: str | None = None
     body_confidence: float = 0.0
     make_models: list[MakeModelScore] = Field(default_factory=list)
+    plate_format: str = "latin_any"
 
 
 class RegistryRecord(BaseModel):

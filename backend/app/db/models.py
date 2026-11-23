@@ -74,6 +74,10 @@ class Clip(Base):
     frame_count: Mapped[int] = mapped_column(Integer, default=0)
     codec: Mapped[str] = mapped_column(String(32), default="")
     plate_script: Mapped[str] = mapped_column(String(16), default="latin")
+    plate_format: Mapped[str] = mapped_column(String(24), default="latin_any")
+    timezone: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    latitude: Mapped[float | None] = mapped_column(Float, nullable=True)
+    longitude: Mapped[float | None] = mapped_column(Float, nullable=True)
     processing: Mapped[dict] = mapped_column(JSON, default=dict)
 
     case: Mapped[Case] = relationship(back_populates="clips")
