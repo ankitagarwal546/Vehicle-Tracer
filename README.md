@@ -709,17 +709,21 @@ flowchart LR
 
 ### Free: serve from your own computer
 
-`deploy/serve_public.sh` runs VITRA on this machine with sign-in on and gives it a public HTTPS address through a free Cloudflare quick tunnel. You don't need an account.
-
-```bash
-brew install cloudflared
-```
+`deploy/serve_public.sh` runs VITRA on this machine with sign-in on and gives it a public HTTPS address through a free tunnel. You don't need an account. It uses a Cloudflare quick tunnel when your network allows it, and otherwise Pinggy over the built-in `ssh` command.
 
 ```bash
 deploy/serve_public.sh
 ```
 
-The first run asks for a sign-in username and password and saves them to the git-ignored `deploy/.env.public`. The script prints a `https://….trycloudflare.com` link. The site stays online only while the script runs and the computer is awake, and the link changes each time it starts.
+The first run asks for a sign-in username and password and saves them to the git-ignored `deploy/.env.public`. The script then prints the public link.
+
+| Tunnel | Free-plan limits |
+| --- | --- |
+| Cloudflare (`brew install cloudflared`) | Link changes on every start. Some networks block it |
+| Pinggy | Link expires every 60 minutes and the script reconnects with a new one. Visitors see a one-time Pinggy warning page and click **Enter site**. The address contains your public IP number |
+| localhost.run (`TUNNEL=localhostrun`) | Throttled to the point that the app takes minutes to load |
+
+The site stays online only while the script runs and the computer is awake.
 
 ### Deploy to Hugging Face Spaces
 

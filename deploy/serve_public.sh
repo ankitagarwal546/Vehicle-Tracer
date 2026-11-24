@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Serve VITRA from this computer at a public HTTPS address through a free Cloudflare quick tunnel.
+# Serve VITRA from this computer at a public HTTPS address through a free tunnel:
+# a Cloudflare quick tunnel when reachable, otherwise Pinggy over SSH (see TUNNEL below).
 # Sign-in is always on. The site stays up only while this script runs and the computer is awake.
 #
 #   deploy/serve_public.sh            first run asks for a sign-in password
@@ -10,7 +11,6 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 ENV_FILE="$ROOT/deploy/.env.public"   # git-ignored, readable only by you
 PORT="${PORT:-7860}"
 
-command -v cloudflared >/dev/null || { echo "cloudflared is missing. Install it with: brew install cloudflared"; exit 1; }
 [ -x "$ROOT/backend/.venv/bin/uvicorn" ] || { echo "Set up the backend first (see Quick start in README.md)."; exit 1; }
 [ "${1:-}" = "--reset" ] && rm -f "$ENV_FILE"
 
@@ -47,8 +47,42 @@ for _ in $(seq 1 60); do
 done
 
 echo
-echo "VITRA is running. Your public link is the https://...trycloudflare.com address printed below."
-echo "Sign in as '$AUTH_USERNAME'. Press Ctrl-C to take the site offline."
+echo "VITRA is running locally. Sign in as '$AUTH_USERNAME'. Press Ctrl-C to take the site offline."
 echo
+
 # caffeinate keeps the Mac from sleeping while the site is online.
-caffeinate -i cloudflared tunnel --no-autoupdate --url "http://127.0.0.1:$PORT"
+# Order: Cloudflare quick tunnel, then Pinggy, then localhost.run. TUNNEL=cloudflare|pinggy|localhostrun forces one.
+choice="${TUNNEL:-auto}"
+if [ "$choice" = "auto" ]; then
+  if command -v cloudflared >/dev/null && curl -s -o /dev/null --max-time 8 -X POST https://api.trycloudflare.com/tunnel; then
+    choice=cloudflare
+  else
+    choice=pinggy
+  fi
+fi
+
+case "$choice" in
+  cloudflare)
+    echo "Opening a Cloudflare tunnel. Your public link is the https://...trycloudflare.com address below."
+    caffeinate -i cloudflared tunnel --no-autoupdate --url "http://127.0.0.1:$PORT" ;;
+  pinggy)
+    echo "Opening a Pinggy tunnel. Your public link is the https://...pinggy... address below."
+    echo "Free Pinggy links last 60 minutes, so the script reconnects and prints a NEW link each hour."
+    # Pinggy's free tier accepts an empty password; answer its prompt automatically.
+    askpass="$(mktemp -t vitra-askpass)"
+    printf '#!/bin/sh\necho\n' > "$askpass"; chmod 700 "$askpass"
+    trap 'rm -f "$askpass"; kill "$server" 2>/dev/null; wait "$server" 2>/dev/null' EXIT INT TERM
+    while kill -0 "$server" 2>/dev/null; do
+      SSH_ASKPASS="$askpass" SSH_ASKPASS_REQUIRE=force caffeinate -i ssh -T -o ServerAliveInterval=30 \
+        -o ExitOnForwardFailure=yes -o StrictHostKeyChecking=accept-new \
+        -o PreferredAuthentications=password,keyboard-interactive \
+        -p 443 -R "0:127.0.0.1:$PORT" a.pinggy.io || true
+      echo "Tunnel closed. Reconnecting with a new link..."
+      sleep 3
+    done ;;
+  localhostrun)
+    echo "Opening a localhost.run tunnel (heavily throttled on the free plan)."
+    caffeinate -i ssh -o ServerAliveInterval=30 -o ExitOnForwardFailure=yes -o StrictHostKeyChecking=accept-new \
+      -R "80:127.0.0.1:$PORT" nokey@localhost.run ;;
+  *) echo "Unknown TUNNEL value: $choice"; exit 1 ;;
+esac

@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from app.api.routes import router
@@ -31,6 +32,8 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
 app = FastAPI(title="VITRA", version=PIPELINE_VERSION, lifespan=lifespan)
 # Added first so CORS stays the outermost layer and also covers 401 responses.
 app.add_middleware(AuthMiddleware)
+# Compresses the web app and JSON (live progress streams are left uncompressed by Starlette).
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[origin.strip() for origin in settings.cors_origins.split(",") if origin.strip()],
