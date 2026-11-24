@@ -99,6 +99,9 @@ class AuthMiddleware(BaseHTTPMiddleware):
 
 
 def _client_key(request: Request) -> str:
+    # Cloudflare sets CF-Connecting-IP itself, so a client cannot spoof it the way it can prefix X-Forwarded-For.
+    if request.headers.get("cf-connecting-ip"):
+        return request.headers["cf-connecting-ip"].strip()
     forwarded = request.headers.get("x-forwarded-for", "")
     return forwarded.split(",")[0].strip() or (request.client.host if request.client else "unknown")
 

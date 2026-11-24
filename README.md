@@ -707,7 +707,24 @@ flowchart LR
 > [!WARNING]
 > There is one shared investigator account. Anyone who knows the password sees every case, so share it only with people who should see the evidence.
 
+### Free: serve from your own computer
+
+`deploy/serve_public.sh` runs VITRA on this machine with sign-in on and gives it a public HTTPS address through a free Cloudflare quick tunnel. You don't need an account.
+
+```bash
+brew install cloudflared
+```
+
+```bash
+deploy/serve_public.sh
+```
+
+The first run asks for a sign-in username and password and saves them to the git-ignored `deploy/.env.public`. The script prints a `https://….trycloudflare.com` link. The site stays online only while the script runs and the computer is awake, and the link changes each time it starts.
+
 ### Deploy to Hugging Face Spaces
+
+Docker Spaces need a Hugging Face PRO subscription.
+
 
 The root `Dockerfile` builds one container. It builds the web app, installs CPU-only PyTorch, bakes in the model weights and serves everything on port 7860 with sign-in required. A free Docker Space has 2 CPUs and 16 GB of RAM, which is enough to run it.
 
