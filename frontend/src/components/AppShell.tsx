@@ -1,4 +1,4 @@
-import { Database, FileText, LayoutDashboard, FolderSearch, ScanSearch, Share2, SquareStack, X, type LucideIcon } from "lucide-react";
+import { Database, FileText, LayoutDashboard, FolderSearch, ScanSearch, Share2, SquareStack, LogOut, X, type LucideIcon } from "lucide-react";
 import { useEffect, useRef, useState, type FormEvent, type ReactNode } from "react";
 import type { CaseSummary, Health } from "../types";
 import { Logo } from "./Logo";
@@ -88,8 +88,10 @@ export function NewCaseDialog({ open, onClose, onCreate }: { open: boolean; onCl
   );
 }
 
-export function AppShell({ view, caseId, cases, health, reviewCount, onNavigate, onSelectCase, banner, children }: {
+export function AppShell({ view, caseId, cases, health, reviewCount, username, onSignOut, onNavigate, onSelectCase, banner, children }: {
   view: View;
+  username?: string | null;
+  onSignOut?: () => void;
   caseId: string | null;
   cases: CaseSummary[];
   health: Health | null;
@@ -136,6 +138,12 @@ export function AppShell({ view, caseId, cases, health, reviewCount, onNavigate,
             <div className="flex justify-between gap-2"><dt>Compute</dt><dd className="num">{health.models.device}</dd></div>
             <div className="flex justify-between gap-2"><dt>Pipeline</dt><dd className="num">v{health.pipeline_version}</dd></div>
           </dl>
+        )}
+        {onSignOut && (
+          <div className="flex items-center gap-2 border-t border-shell-line px-3 py-2 text-2xs text-shell-muted lg:px-4 lg:py-3">
+            <span className="min-w-0 flex-1 truncate">Signed in as <span className="font-semibold text-shell-text">{username}</span></span>
+            <button type="button" onClick={onSignOut} className="inline-flex items-center gap-1 rounded-evidence px-1.5 py-1 text-shell-text hover:bg-shell-raised hover:text-white"><LogOut size={13} /> Sign out</button>
+          </div>
         )}
       </aside>
       {banner}

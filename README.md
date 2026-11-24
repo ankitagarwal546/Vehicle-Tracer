@@ -36,6 +36,7 @@ Its core rule is simple: **VITRA never invents a plate character.** If the foota
 - [Results](#results)
 - [Reports and exports](#reports-and-exports)
 - [Configuration](#configuration)
+- [Sign-in and online deployment](#sign-in-and-online-deployment)
 - [API reference](#api-reference)
 - [Testing and evaluation](#testing-and-evaluation)
 - [Known limitations](#known-limitations)
@@ -677,6 +678,58 @@ Every setting can be overridden with an environment variable or `backend/.env`.
 | `MAX_PLAUSIBLE_SPEED_KMH` | `140` | Travel speed limit for link checks |
 | `ANALYSIS_WORKERS` | `0` | `0` uses half the CPU cores, up to 4 |
 | `MAX_UPLOAD_MB` | `1024` | Maximum upload size |
+| `AUTH_USERNAME` | `admin` | Sign-in username |
+| `AUTH_PASSWORD` | empty | Sign-in password. Empty turns sign-in off |
+| `SESSION_SECRET` | random per start | Key that signs session cookies |
+| `SESSION_HOURS` | `12` | How long a sign-in lasts |
+| `REQUIRE_AUTH` | `false` | Refuse to start without `AUTH_PASSWORD` |
+| `COOKIE_SECURE` / `COOKIE_SAMESITE` | `false` / `lax` | Cookie flags. Set `true` / `none` behind HTTPS in an iframe |
+| `FRONTEND_DIST` | not set | Folder of the built web app to serve from the API |
+
+## Sign-in and online deployment
+
+When `AUTH_PASSWORD` is set, every case, evidence, registry and report route requires sign-in. Only `/api/health` and the sign-in endpoints stay public.
+
+```mermaid
+flowchart LR
+    A["Browser"] -->|"username + password"| B["/api/auth/login"]
+    B -->|"Signed, HTTP-only cookie"| A
+    A -->|"Cookie sent automatically"| C{"Valid and<br/>not expired?"}
+    C -- Yes --> D["Cases, evidence,<br/>registry, reports"]
+    C -- No --> E["401: sign-in page"]
+```
+
+- Sessions are HMAC-signed cookies that page scripts cannot read.
+- Five failed attempts lock that address out for five minutes.
+- Write requests from other websites are rejected.
+- Without a password, sign-in is off. Only run it like that on your own machine.
+
+> [!WARNING]
+> There is one shared investigator account. Anyone who knows the password sees every case, so share it only with people who should see the evidence.
+
+### Deploy to Hugging Face Spaces
+
+The root `Dockerfile` builds one container. It builds the web app, installs CPU-only PyTorch, bakes in the model weights and serves everything on port 7860 with sign-in required. A free Docker Space has 2 CPUs and 16 GB of RAM, which is enough to run it.
+
+1. Create a [Hugging Face](https://huggingface.co/join) account and an access token with **write** permission.
+2. From the repository root, run:
+
+```bash
+backend/.venv/bin/python deploy/deploy_huggingface.py --space <your-username>/vitra
+```
+
+The script asks for the token and a sign-in password. It stores the password as a Space secret, generates `SESSION_SECRET`, uploads the code and starts the build. The first build takes about 10 to 15 minutes. Then open `https://<your-username>-vitra.hf.space`.
+
+Add `--private` for a private Space. To publish new code without changing the password, use `--keep-secrets`.
+
+> [!NOTE]
+> Free Spaces have no persistent disk. Cases, uploads and the database reset whenever the Space restarts or sleeps. Attach paid persistent storage and set `DATABASE_URL`, `UPLOAD_DIR` and `ARTIFACT_DIR` under `/data` to keep them.
+
+The same image runs on any Docker host:
+
+```bash
+docker build -t vitra . && docker run -p 7860:7860 -e AUTH_PASSWORD='choose-a-long-password' -e SESSION_SECRET="$(openssl rand -hex 32)" vitra
+```
 
 ## API reference
 
@@ -687,7 +740,10 @@ Every setting can be overridden with an environment variable or `backend/.env`.
 
 | Method | Endpoint | Purpose |
 | --- | --- | --- |
-| GET | `/api/health` | System, model, device and registry status |
+| GET | `/api/health` | System, model, device and registry status (public) |
+| POST | `/api/auth/login` | Sign in and receive the session cookie |
+| POST | `/api/auth/logout` | Sign out |
+| GET | `/api/auth/session` | Whether sign-in is on and who is signed in |
 
 **Cases and evidence**
 
@@ -761,8 +817,8 @@ The tests cover matching gates, plate fusion, registry coverage, unknown-charact
 - Colour, body type and make/model are approximate estimates and are sometimes wrong.
 - The EasyOCR fallback is available only if its weights are already installed.
 - Earlier analysis runs keep their raw crops, so repeated analysis uses more disk space.
-- The Docker setup has not been run, and WeasyPrint needs native Pango libraries. Without them, PDFs use the ReportLab layout.
-- The API has no authentication. Add access control before any deployment beyond a local machine.
+- Neither Docker setup has been built locally (Docker was not available), and WeasyPrint needs native Pango libraries. Without them, PDFs use the ReportLab layout.
+- Sign-in uses one shared account, with no per-user roles. The audit log records actions under the investigator label, not each person's name.
 
 ## Licensing
 

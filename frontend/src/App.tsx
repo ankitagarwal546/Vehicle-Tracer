@@ -1,6 +1,6 @@
 import { X } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { api } from "./api/client";
+import { api, type SessionState, UNAUTHORIZED_EVENT } from "./api/client";
 import { AppShell, NewCaseDialog, type View } from "./components/AppShell";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { Loading, OUTCOME_ORDER } from "./components/ui";
@@ -10,6 +10,7 @@ import CaseWorkspace from "./pages/CaseWorkspace";
 import Dashboard from "./pages/Dashboard";
 import Investigations from "./pages/Investigations";
 import Landing from "./pages/Landing";
+import Login from "./pages/Login";
 import RegistryManager from "./pages/RegistryManager";
 import Reports from "./pages/Reports";
 import Traceability from "./pages/Traceability";
@@ -52,6 +53,8 @@ export default function App() {
   const [loading, setLoading] = useState(Boolean(route.caseId));
   const [loadFailed, setLoadFailed] = useState(false);
   const [registryVersion, setRegistryVersion] = useState(0);
+  const [session, setSession] = useState<SessionState | null>(null);
+  const authorized = Boolean(session?.authenticated);
   const routeRef = useRef(route);
   routeRef.current = route;
 
@@ -106,7 +109,24 @@ export default function App() {
     setLoading(Boolean(caseId));
   }, [caseId]);
 
-  useEffect(() => { void refresh(); void refreshHealth(); }, [refresh, refreshHealth]);
+  useEffect(() => {
+    api.session().then(setSession).catch(() => setSession({ auth_enabled: true, authenticated: false, username: null }));
+    const onUnauthorized = () => setSession((current) => current && { ...current, authenticated: false, username: null });
+    window.addEventListener(UNAUTHORIZED_EVENT, onUnauthorized);
+    return () => window.removeEventListener(UNAUTHORIZED_EVENT, onUnauthorized);
+  }, []);
+
+  useEffect(() => { void refreshHealth(); }, [refreshHealth]);
+  useEffect(() => {
+    if (authorized) void refresh();
+    else { setCases([]); setCasesLoaded(false); setDetail(null); setVehicles([]); setEntities([]); setError(""); }
+  }, [authorized, refresh]);
+
+  const signOut = useCallback(async () => {
+    await api.logout().catch(() => undefined);
+    setSession((current) => current && { ...current, authenticated: false, username: null });
+    window.location.hash = "#/";
+  }, []);
 
   useEffect(() => {
     const onHash = () => {
@@ -120,10 +140,10 @@ export default function App() {
 
   const anyRunning = cases.some(isActiveRun);
   useEffect(() => {
-    if (!overviewEnabled || !anyRunning) return;
+    if (!authorized || !overviewEnabled || !anyRunning) return;
     const timer = window.setInterval(() => void refresh(), OVERVIEW_POLL_MS);
     return () => window.clearInterval(timer);
-  }, [overviewEnabled, anyRunning, refresh]);
+  }, [authorized, overviewEnabled, anyRunning, refresh]);
 
   const go = useCallback((target: View, options: { caseId?: string; vehicleId?: string } = {}) => {
     const next = buildHash(target, options.caseId ?? caseId, options.vehicleId);
@@ -171,11 +191,13 @@ export default function App() {
   );
 
   if (view === "home") return <Landing cases={cases} casesReady={casesLoaded} health={health} onEnter={() => go("dashboard")} />;
+  if (!session) return <div className="on-shell flex min-h-full items-center justify-center bg-shell"><Loading>Checking your session…</Loading></div>;
+  if (!authorized) return <Login onBack={() => go("home")} onSignedIn={setSession} />;
 
   const needsCase = CASE_VIEWS.includes(view);
 
   return (
-    <AppShell view={view} caseId={caseId} cases={cases} health={health} reviewCount={review} onNavigate={(next) => go(next)} onSelectCase={openCase} banner={banner}>
+    <AppShell view={view} caseId={caseId} cases={cases} health={health} reviewCount={review} username={session.username} onSignOut={session.auth_enabled ? signOut : undefined} onNavigate={(next) => go(next)} onSelectCase={openCase} banner={banner}>
       <NewCaseDialog open={creating} onClose={() => setCreating(false)} onCreate={createCase} />
       <ErrorBoundary resetKey={`${caseId}-${view}-${vehicleId}`}>
         {loadFailed && !detail && needsCase ? (

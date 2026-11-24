@@ -17,6 +17,11 @@ import type {
   VehicleSummary,
 } from "../types";
 
+/** Fired when the server says the session has ended, so the app can show the sign-in page. */
+export const UNAUTHORIZED_EVENT = "vitra:unauthorized";
+
+export interface SessionState { auth_enabled: boolean; authenticated: boolean; username: string | null }
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   let response: Response;
   try {
@@ -24,6 +29,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   } catch {
     throw new Error("Backend is unreachable. Check that the API server is running on port 8000.");
   }
+  if (response.status === 401 && !path.startsWith("/auth/")) window.dispatchEvent(new Event(UNAUTHORIZED_EVENT));
   if (!response.ok) {
     const body = await response.json().catch(() => null);
     const detail = body?.detail;
@@ -51,6 +57,9 @@ export interface ClipUpload {
 }
 
 export const api = {
+  session: () => request<SessionState>("/auth/session"),
+  login: (username: string, password: string) => request<SessionState>("/auth/login", json({ username, password })),
+  logout: () => request<SessionState>("/auth/logout", { method: "POST" }),
   health: () => request<Health>("/health"),
   listCases: () => request<CaseSummary[]>("/cases"),
   getCase: (id: string) => request<CaseDetail>(`/cases/${id}`),

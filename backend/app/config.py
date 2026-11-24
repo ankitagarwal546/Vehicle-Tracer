@@ -46,6 +46,18 @@ class Settings(BaseSettings):
     analysis_workers: int = 0  # 0: half the CPU cores, capped at 4
     max_upload_mb: int = 1024
 
+    # Sign-in. Leaving AUTH_PASSWORD empty disables it, which is only safe on a private machine.
+    auth_username: str = "admin"
+    auth_password: str = ""
+    session_secret: str = ""
+    session_hours: float = 12.0
+    require_auth: bool = False  # refuse to start without AUTH_PASSWORD (set in the deploy image)
+    cookie_secure: bool = False  # true behind HTTPS
+    cookie_samesite: str = "lax"  # "none" lets the session work inside an embedding iframe (needs HTTPS)
+
+    # Serve the built web app from the API server (single-container deploys).
+    frontend_dist: Path | None = None
+
 
 settings = Settings()
 for directory in (settings.upload_dir, settings.artifact_dir, settings.model_dir):
