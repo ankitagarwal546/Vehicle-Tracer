@@ -2,7 +2,7 @@
 
 Run from the repository root, in your own terminal:
 
-    backend/.venv/bin/python deploy/deploy_huggingface.py --space <your-hf-username>/vitra
+    backend/.venv/bin/python deploy/deploy_huggingface.py [--space <your-hf-username>/vitra]
 
 It asks for your Hugging Face token (write access) if you are not logged in, and for the
 VITRA sign-in password. The password is stored only as a Space secret, never in the repository.
@@ -31,7 +31,7 @@ def tracked_files() -> list[str]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--space", required=True, help="Space id, for example your-name/vitra")
+    parser.add_argument("--space", help="Space id, for example your-name/vitra (default: <your username>/vitra)")
     parser.add_argument("--username", default="admin", help="VITRA sign-in username (default: admin)")
     parser.add_argument("--private", action="store_true", help="Create the Space as private instead of public")
     parser.add_argument("--keep-secrets", action="store_true", help="Do not change the Space's existing password secrets")
@@ -41,6 +41,9 @@ def main() -> int:
         print("Log in with a Hugging Face token that has write access.")
         login()
     api = HfApi()
+    if not args.space:
+        args.space = f"{api.whoami()['name']}/vitra"
+    print(f"Deploying to the Space {args.space}")
 
     api.create_repo(args.space, repo_type="space", space_sdk="docker", private=args.private, exist_ok=True)
 

@@ -715,8 +715,10 @@ The root `Dockerfile` builds one container. It builds the web app, installs CPU-
 2. From the repository root, run:
 
 ```bash
-backend/.venv/bin/python deploy/deploy_huggingface.py --space <your-username>/vitra
+backend/.venv/bin/python deploy/deploy_huggingface.py
 ```
+
+It deploys to `<your-username>/vitra`. Pass `--space name/space` to choose another name.
 
 The script asks for the token and a sign-in password. It stores the password as a Space secret, generates `SESSION_SECRET`, uploads the code and starts the build. The first build takes about 10 to 15 minutes. Then open `https://<your-username>-vitra.hf.space`.
 
